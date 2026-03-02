@@ -1,0 +1,989 @@
+"""Umbra ERP MCP Server — Enables Claude/Mufasa to manage ERP data via Umbra public API.
+
+Production API: https://umbra-erp-api-europenorth1-ynddvnxogq-lz.a.run.app
+Staging API:    https://staging-umbra-erp-api-europenorth1-ynddvnxogq-lz.a.run.app
+Auth: X-Api-Key header
+API key retrieved from env var or ~/.claude/scripts/.env
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+import os
+from typing import Any
+
+import httpx
+from mcp.server.fastmcp import FastMCP
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
+log = logging.getLogger("umbra-mcp")
+
+# ============================================================================
+# Configuration
+# ============================================================================
+
+UMBRA_BASE_URL = os.environ.get(
+    "UMBRA_API_URL",
+    "https://umbra-erp-api-europenorth1-ynddvnxogq-lz.a.run.app",
+)
+
+_api_key: str | None = None
+
+
+def _get_api_key() -> str:
+    """Get Umbra API key with caching."""
+    global _api_key
+    if _api_key:
+        return _api_key
+
+    key = os.environ.get("UMBRA_API_KEY", "")
+    if key:
+        _api_key = key
+        return key
+
+    env_file = os.path.expanduser("~/.claude/scripts/.env")
+    try:
+        with open(env_file) as f:
+            for line in f:
+                line = line.strip()
+                if line.startswith("UMBRA_API_KEY="):
+                    key = line.split("=", 1)[1]
+                    if key:
+                        _api_key = key
+                        return key
+    except FileNotFoundError:
+        pass
+
+    raise ValueError("No Umbra API key found. Set UMBRA_API_KEY env var or add to ~/.claude/scripts/.env")
+
+
+# ============================================================================
+# HTTP helpers
+# ============================================================================
+
+def _headers() -> dict[str, str]:
+    return {"X-Api-Key": _get_api_key(), "Content-Type": "application/json"}
+
+
+def _get(path: str, params: dict | None = None) -> Any:
+    url = f"{UMBRA_BASE_URL}{path}"
+    log.info("GET %s", url)
+    with httpx.Client(timeout=30) as client:
+        resp = client.get(url, headers=_headers(), params=params or {})
+        resp.raise_for_status()
+        return resp.json()
+
+
+def _post(path: str, data: dict) -> Any:
+    url = f"{UMBRA_BASE_URL}{path}"
+    log.info("POST %s", url)
+    with httpx.Client(timeout=30) as client:
+        resp = client.post(url, headers=_headers(), json=data)
+        resp.raise_for_status()
+        return resp.json()
+
+
+def _put(path: str, data: dict) -> Any:
+    url = f"{UMBRA_BASE_URL}{path}"
+    log.info("PUT %s", url)
+    with httpx.Client(timeout=30) as client:
+        resp = client.put(url, headers=_headers(), json=data)
+        resp.raise_for_status()
+        return resp.json()
+
+
+def _delete(path: str) -> Any:
+    url = f"{UMBRA_BASE_URL}{path}"
+    log.info("DELETE %s", url)
+    with httpx.Client(timeout=30) as client:
+        resp = client.delete(url, headers=_headers())
+        resp.raise_for_status()
+        return resp.json()
+
+
+def _ok(result: Any) -> str:
+    return json.dumps(result, indent=2, default=str)
+
+
+def _err(e: Exception) -> str:
+    if isinstance(e, httpx.HTTPStatusError):
+        return json.dumps({"error": f"HTTP {e.response.status_code}", "detail": e.response.text[:500]})
+    return json.dumps({"error": str(e)})
+
+
+# ============================================================================
+# MCP Server
+# ============================================================================
+
+mcp = FastMCP(
+    "Umbra ERP",
+    instructions=(
+        "Manage ERP data (customers, invoices, products, quotes, payments, employees, leave requests, webhooks) "
+        "via the Umbra ERP public API. Used by Mufasa for business operations on Lioncap Ventures."
+    ),
+)
+
+
+# ── CUSTOMERS ────────────────────────────────────────────────────────────────
+
+@mcp.tool()
+def list_customers(
+    limit: int = 50,
+    skip: int = 0,
+    search: str | None = None,
+    industry: str | None = None,
+    country: str | None = None,
+) -> str:
+    """List customers with optional filters.
+
+    Args:
+        limit: Max results (1-100, default 50)
+        skip: Offset for pagination
+        search: Search by company name, contact name, or email
+        industry: Filter by industry
+        country: Filter by country
+    """
+    params: dict[str, Any] = {"limit": limit, "skip": skip}
+    if search:
+        params["search"] = search
+    if industry:
+        params["industry"] = industry
+    if country:
+        params["country"] = country
+    try:
+        return _ok(_get("/v1/customers", params))
+    except Exception as e:
+        return _err(e)
+
+
+@mcp.tool()
+def get_customer(customer_id: str) -> str:
+    """Get a single customer by ID.
+
+    Args:
+        customer_id: The customer's public UUID
+    """
+    try:
+        return _ok(_get(f"/v1/customers/{customer_id}"))
+    except Exception as e:
+        return _err(e)
+
+
+@mcp.tool()
+def create_customer(
+    company_name: str,
+    contact_name: str | None = None,
+    email: str | None = None,
+    phone: str | None = None,
+    industry: str | None = None,
+    country: str | None = None,
+    currency: str = "USD",
+    address: str | None = None,
+    city: str | None = None,
+    website: str | None = None,
+    notes: str | None = None,
+) -> str:
+    """Create a new customer in the ERP.
+
+    Args:
+        company_name: Company/organization name (required)
+        contact_name: Primary contact person's name
+        email: Contact email
+        phone: Contact phone (e.g., "+263771234567")
+        industry: Industry/sector
+        country: Country name
+        currency: Currency code (default USD)
+        address: Street address
+        city: City
+        website: Website URL
+        notes: Additional notes
+    """
+    data: dict[str, Any] = {"companyName": company_name, "currency": currency}
+    if contact_name:
+        data["contactName"] = contact_name
+    if email:
+        data["email"] = email
+    if phone:
+        data["phone"] = phone
+    if industry:
+        data["industry"] = industry
+    if country:
+        data["country"] = country
+    if address:
+        data["address"] = address
+    if city:
+        data["city"] = city
+    if website:
+        data["website"] = website
+    if notes:
+        data["notes"] = notes
+    try:
+        return _ok(_post("/v1/customers", data))
+    except Exception as e:
+        return _err(e)
+
+
+@mcp.tool()
+def update_customer(customer_id: str, updates: str) -> str:
+    """Update a customer. Pass a JSON string of fields to update.
+
+    Args:
+        customer_id: The customer's public UUID
+        updates: JSON string with fields to update, e.g. '{"companyName": "New Name", "phone": "+263..."}'
+    """
+    try:
+        data = json.loads(updates)
+        return _ok(_put(f"/v1/customers/{customer_id}", data))
+    except json.JSONDecodeError:
+        return json.dumps({"error": "Invalid JSON in updates parameter"})
+    except Exception as e:
+        return _err(e)
+
+
+@mcp.tool()
+def delete_customer(customer_id: str) -> str:
+    """Delete a customer.
+
+    Args:
+        customer_id: The customer's public UUID
+    """
+    try:
+        return _ok(_delete(f"/v1/customers/{customer_id}"))
+    except Exception as e:
+        return _err(e)
+
+
+# ── INVOICES ─────────────────────────────────────────────────────────────────
+
+@mcp.tool()
+def list_invoices(
+    limit: int = 50,
+    skip: int = 0,
+    status: str | None = None,
+    customer_id: str | None = None,
+) -> str:
+    """List invoices with optional filters.
+
+    Args:
+        limit: Max results (1-100)
+        skip: Offset for pagination
+        status: Filter by status (draft, sent, paid, overdue, cancelled)
+        customer_id: Filter by customer UUID
+    """
+    params: dict[str, Any] = {"limit": limit, "skip": skip}
+    if status:
+        params["status"] = status
+    if customer_id:
+        params["customer_id"] = customer_id
+    try:
+        return _ok(_get("/v1/invoices", params))
+    except Exception as e:
+        return _err(e)
+
+
+@mcp.tool()
+def get_invoice(invoice_id: str) -> str:
+    """Get a single invoice with line items.
+
+    Args:
+        invoice_id: The invoice's public UUID
+    """
+    try:
+        return _ok(_get(f"/v1/invoices/{invoice_id}"))
+    except Exception as e:
+        return _err(e)
+
+
+@mcp.tool()
+def create_invoice(
+    customer_id: str,
+    invoice_date: str,
+    due_date: str,
+    currency: str,
+    subtotal: float,
+    total: float,
+    balance_due: float,
+    items: str,
+    notes: str | None = None,
+    tax_amount: float | None = None,
+    discount_amount: float | None = None,
+) -> str:
+    """Create a new invoice.
+
+    Args:
+        customer_id: Customer UUID
+        invoice_date: Date string (YYYY-MM-DD)
+        due_date: Due date (YYYY-MM-DD)
+        currency: Currency code (USD, ZAR, etc.)
+        subtotal: Subtotal in dollars (e.g., 500.00)
+        total: Total in dollars
+        balance_due: Balance due in dollars
+        items: JSON string array of line items, e.g. '[{"title":"Consulting","quantity":2,"unitPrice":250.00,"total":500.00}]'
+        notes: Optional notes
+        tax_amount: Tax amount in dollars
+        discount_amount: Discount amount in dollars
+    """
+    try:
+        line_items = json.loads(items)
+    except json.JSONDecodeError:
+        return json.dumps({"error": "Invalid JSON in items parameter"})
+
+    data: dict[str, Any] = {
+        "customerId": customer_id,
+        "invoiceDate": invoice_date,
+        "dueDate": due_date,
+        "currency": currency,
+        "subtotal": subtotal,
+        "total": total,
+        "balanceDue": balance_due,
+        "items": line_items,
+    }
+    if notes:
+        data["notes"] = notes
+    if tax_amount is not None:
+        data["taxAmount"] = tax_amount
+    if discount_amount is not None:
+        data["discountAmount"] = discount_amount
+    try:
+        return _ok(_post("/v1/invoices", data))
+    except Exception as e:
+        return _err(e)
+
+
+@mcp.tool()
+def update_invoice(invoice_id: str, updates: str) -> str:
+    """Update an invoice. Pass a JSON string of fields to update.
+
+    Args:
+        invoice_id: The invoice's public UUID
+        updates: JSON string with fields to update, e.g. '{"status": "sent", "notes": "Updated"}'
+    """
+    try:
+        data = json.loads(updates)
+        return _ok(_put(f"/v1/invoices/{invoice_id}", data))
+    except json.JSONDecodeError:
+        return json.dumps({"error": "Invalid JSON in updates parameter"})
+    except Exception as e:
+        return _err(e)
+
+
+@mcp.tool()
+def delete_invoice(invoice_id: str) -> str:
+    """Delete an invoice.
+
+    Args:
+        invoice_id: The invoice's public UUID
+    """
+    try:
+        return _ok(_delete(f"/v1/invoices/{invoice_id}"))
+    except Exception as e:
+        return _err(e)
+
+
+# ── PRODUCTS ─────────────────────────────────────────────────────────────────
+
+@mcp.tool()
+def list_products(
+    limit: int = 50,
+    skip: int = 0,
+    category: str | None = None,
+    product_type: str | None = None,
+) -> str:
+    """List products with optional filters.
+
+    Args:
+        limit: Max results (1-100)
+        skip: Offset for pagination
+        category: Filter by category
+        product_type: Filter by type (physical, digital, service)
+    """
+    params: dict[str, Any] = {"limit": limit, "skip": skip}
+    if category:
+        params["category"] = category
+    if product_type:
+        params["type"] = product_type
+    try:
+        return _ok(_get("/v1/products", params))
+    except Exception as e:
+        return _err(e)
+
+
+@mcp.tool()
+def get_product(product_id: str) -> str:
+    """Get a single product.
+
+    Args:
+        product_id: The product's public UUID
+    """
+    try:
+        return _ok(_get(f"/v1/products/{product_id}"))
+    except Exception as e:
+        return _err(e)
+
+
+@mcp.tool()
+def create_product(
+    name: str,
+    price: float,
+    currency: str = "USD",
+    sku: str | None = None,
+    cost_price: float | None = None,
+    description: str | None = None,
+    category: str | None = None,
+    product_type: str = "physical",
+) -> str:
+    """Create a new product.
+
+    Args:
+        name: Product name (required)
+        price: Selling price in dollars (e.g., 99.99)
+        currency: Currency code (default USD)
+        sku: Stock keeping unit code
+        cost_price: Cost price in dollars
+        description: Product description
+        category: Product category
+        product_type: Type: physical, digital, or service
+    """
+    data: dict[str, Any] = {"name": name, "price": price, "currency": currency, "type": product_type}
+    if sku:
+        data["sku"] = sku
+    if cost_price is not None:
+        data["costPrice"] = cost_price
+    if description:
+        data["description"] = description
+    if category:
+        data["category"] = category
+    try:
+        return _ok(_post("/v1/products", data))
+    except Exception as e:
+        return _err(e)
+
+
+@mcp.tool()
+def update_product(product_id: str, updates: str) -> str:
+    """Update a product. Pass a JSON string of fields to update.
+
+    Args:
+        product_id: The product's public UUID
+        updates: JSON string with fields to update
+    """
+    try:
+        data = json.loads(updates)
+        return _ok(_put(f"/v1/products/{product_id}", data))
+    except json.JSONDecodeError:
+        return json.dumps({"error": "Invalid JSON in updates parameter"})
+    except Exception as e:
+        return _err(e)
+
+
+@mcp.tool()
+def delete_product(product_id: str) -> str:
+    """Delete a product.
+
+    Args:
+        product_id: The product's public UUID
+    """
+    try:
+        return _ok(_delete(f"/v1/products/{product_id}"))
+    except Exception as e:
+        return _err(e)
+
+
+# ── QUOTES ───────────────────────────────────────────────────────────────────
+
+@mcp.tool()
+def list_quotes(
+    limit: int = 50,
+    skip: int = 0,
+    status: str | None = None,
+    customer_id: str | None = None,
+) -> str:
+    """List quotes with optional filters.
+
+    Args:
+        limit: Max results (1-100)
+        skip: Offset for pagination
+        status: Filter by status (draft, sent, accepted, rejected, expired)
+        customer_id: Filter by customer UUID
+    """
+    params: dict[str, Any] = {"limit": limit, "skip": skip}
+    if status:
+        params["status"] = status
+    if customer_id:
+        params["customer_id"] = customer_id
+    try:
+        return _ok(_get("/v1/quotes", params))
+    except Exception as e:
+        return _err(e)
+
+
+@mcp.tool()
+def get_quote(quote_id: str) -> str:
+    """Get a single quote with line items.
+
+    Args:
+        quote_id: The quote's public UUID
+    """
+    try:
+        return _ok(_get(f"/v1/quotes/{quote_id}"))
+    except Exception as e:
+        return _err(e)
+
+
+@mcp.tool()
+def create_quote(
+    customer_id: str,
+    title: str,
+    quote_date: str,
+    expiry_date: str,
+    subtotal: float,
+    total: float,
+    items: str,
+    notes: str | None = None,
+) -> str:
+    """Create a new quote.
+
+    Args:
+        customer_id: Customer UUID
+        title: Quote title
+        quote_date: Date string (YYYY-MM-DD)
+        expiry_date: Expiry date (YYYY-MM-DD)
+        subtotal: Subtotal in dollars
+        total: Total in dollars
+        items: JSON string array of line items, e.g. '[{"description":"Widget","quantity":5,"unitPrice":200.00,"total":1000.00}]'
+        notes: Optional notes
+    """
+    try:
+        line_items = json.loads(items)
+    except json.JSONDecodeError:
+        return json.dumps({"error": "Invalid JSON in items parameter"})
+
+    data: dict[str, Any] = {
+        "customerId": customer_id,
+        "title": title,
+        "quoteDate": quote_date,
+        "expiryDate": expiry_date,
+        "subtotal": subtotal,
+        "total": total,
+        "items": line_items,
+    }
+    if notes:
+        data["notes"] = notes
+    try:
+        return _ok(_post("/v1/quotes", data))
+    except Exception as e:
+        return _err(e)
+
+
+@mcp.tool()
+def update_quote(quote_id: str, updates: str) -> str:
+    """Update a quote. Pass a JSON string of fields to update.
+
+    Args:
+        quote_id: The quote's public UUID
+        updates: JSON string with fields to update
+    """
+    try:
+        data = json.loads(updates)
+        return _ok(_put(f"/v1/quotes/{quote_id}", data))
+    except json.JSONDecodeError:
+        return json.dumps({"error": "Invalid JSON in updates parameter"})
+    except Exception as e:
+        return _err(e)
+
+
+@mcp.tool()
+def delete_quote(quote_id: str) -> str:
+    """Delete a quote.
+
+    Args:
+        quote_id: The quote's public UUID
+    """
+    try:
+        return _ok(_delete(f"/v1/quotes/{quote_id}"))
+    except Exception as e:
+        return _err(e)
+
+
+# ── PAYMENTS ─────────────────────────────────────────────────────────────────
+
+@mcp.tool()
+def list_payments(
+    limit: int = 50,
+    skip: int = 0,
+    customer_id: str | None = None,
+) -> str:
+    """List payments with optional filters.
+
+    Args:
+        limit: Max results (1-100)
+        skip: Offset for pagination
+        customer_id: Filter by customer UUID
+    """
+    params: dict[str, Any] = {"limit": limit, "skip": skip}
+    if customer_id:
+        params["customer_id"] = customer_id
+    try:
+        return _ok(_get("/v1/payments", params))
+    except Exception as e:
+        return _err(e)
+
+
+@mcp.tool()
+def get_payment(payment_id: str) -> str:
+    """Get a single payment.
+
+    Args:
+        payment_id: The payment's public UUID
+    """
+    try:
+        return _ok(_get(f"/v1/payments/{payment_id}"))
+    except Exception as e:
+        return _err(e)
+
+
+@mcp.tool()
+def create_payment(
+    customer_id: str,
+    amount: float,
+    currency: str = "USD",
+    payment_method: str = "bank_transfer",
+    payment_reference: str | None = None,
+    invoice_id: str | None = None,
+    notes: str | None = None,
+) -> str:
+    """Record a payment.
+
+    Args:
+        customer_id: Customer UUID
+        amount: Payment amount in dollars (e.g., 250.00)
+        currency: Currency code (default USD)
+        payment_method: Method: bank_transfer, cash, card, mobile_money, other
+        payment_reference: External reference number
+        invoice_id: Link to invoice UUID (optional)
+        notes: Additional notes
+    """
+    data: dict[str, Any] = {
+        "customerId": customer_id,
+        "amount": amount,
+        "currency": currency,
+        "paymentMethod": payment_method,
+    }
+    if payment_reference:
+        data["paymentReference"] = payment_reference
+    if invoice_id:
+        data["invoiceId"] = invoice_id
+    if notes:
+        data["notes"] = notes
+    try:
+        return _ok(_post("/v1/payments", data))
+    except Exception as e:
+        return _err(e)
+
+
+# ── EMPLOYEES ────────────────────────────────────────────────────────────────
+
+@mcp.tool()
+def list_employees(
+    limit: int = 50,
+    skip: int = 0,
+    status: str | None = None,
+    department: str | None = None,
+    search: str | None = None,
+) -> str:
+    """List employees with optional filters.
+
+    Args:
+        limit: Max results (1-100)
+        skip: Offset for pagination
+        status: Filter by status (active, on_leave, suspended, terminated)
+        department: Filter by department name
+        search: Search by name, email, or employee ID
+    """
+    params: dict[str, Any] = {"limit": limit, "skip": skip}
+    if status:
+        params["status"] = status
+    if department:
+        params["department"] = department
+    if search:
+        params["search"] = search
+    try:
+        return _ok(_get("/v1/employees", params))
+    except Exception as e:
+        return _err(e)
+
+
+@mcp.tool()
+def get_employee(employee_id: str) -> str:
+    """Get a single employee. Includes sensitive fields (salary, bank details) since using secret key.
+
+    Args:
+        employee_id: The employee's public UUID
+    """
+    try:
+        return _ok(_get(f"/v1/employees/{employee_id}"))
+    except Exception as e:
+        return _err(e)
+
+
+@mcp.tool()
+def create_employee(
+    first_name: str,
+    last_name: str,
+    email: str | None = None,
+    phone: str | None = None,
+    job_title: str | None = None,
+    department: str | None = None,
+    employment_type: str = "full_time",
+    hire_date: str | None = None,
+    salary: float | None = None,
+    salary_currency: str = "USD",
+    country: str | None = None,
+) -> str:
+    """Create a new employee.
+
+    Args:
+        first_name: First name (required)
+        last_name: Last name (required)
+        email: Email address
+        phone: Phone number
+        job_title: Job title
+        department: Department name
+        employment_type: Type: full_time, part_time, contract
+        hire_date: Hire date (YYYY-MM-DD)
+        salary: Monthly salary in dollars
+        salary_currency: Currency (default USD)
+        country: Country
+    """
+    data: dict[str, Any] = {
+        "firstName": first_name,
+        "lastName": last_name,
+        "employmentType": employment_type,
+        "salaryCurrency": salary_currency,
+    }
+    if email:
+        data["email"] = email
+    if phone:
+        data["phone"] = phone
+    if job_title:
+        data["jobTitle"] = job_title
+    if department:
+        data["department"] = department
+    if hire_date:
+        data["hireDate"] = hire_date
+    if salary is not None:
+        data["salary"] = salary
+    if country:
+        data["country"] = country
+    try:
+        return _ok(_post("/v1/employees", data))
+    except Exception as e:
+        return _err(e)
+
+
+@mcp.tool()
+def update_employee(employee_id: str, updates: str) -> str:
+    """Update an employee. Pass a JSON string of fields to update.
+
+    Args:
+        employee_id: The employee's public UUID
+        updates: JSON string with fields to update, e.g. '{"jobTitle": "CTO", "salary": 10000}'
+    """
+    try:
+        data = json.loads(updates)
+        return _ok(_put(f"/v1/employees/{employee_id}", data))
+    except json.JSONDecodeError:
+        return json.dumps({"error": "Invalid JSON in updates parameter"})
+    except Exception as e:
+        return _err(e)
+
+
+@mcp.tool()
+def delete_employee(employee_id: str) -> str:
+    """Soft-delete an employee (marks as terminated/inactive).
+
+    Args:
+        employee_id: The employee's public UUID
+    """
+    try:
+        return _ok(_delete(f"/v1/employees/{employee_id}"))
+    except Exception as e:
+        return _err(e)
+
+
+# ── LEAVE REQUESTS ───────────────────────────────────────────────────────────
+
+@mcp.tool()
+def list_leave_requests(employee_id: str, limit: int = 50, skip: int = 0) -> str:
+    """List leave requests for a specific employee.
+
+    Args:
+        employee_id: The employee's public UUID
+        limit: Max results (1-100)
+        skip: Offset for pagination
+    """
+    params: dict[str, Any] = {"limit": limit, "skip": skip}
+    try:
+        return _ok(_get(f"/v1/employees/{employee_id}/leave", params))
+    except Exception as e:
+        return _err(e)
+
+
+@mcp.tool()
+def create_leave_request(
+    employee_id: str,
+    leave_type: str,
+    start_date: str,
+    end_date: str,
+    days_requested: float,
+    reason: str | None = None,
+) -> str:
+    """Create a leave request for an employee. Starts as 'pending'.
+
+    Args:
+        employee_id: The employee's public UUID
+        leave_type: Type: annual, sick, maternity, paternity, unpaid, compassionate, other
+        start_date: Start date (YYYY-MM-DD)
+        end_date: End date (YYYY-MM-DD)
+        days_requested: Number of days
+        reason: Reason for leave
+    """
+    data: dict[str, Any] = {
+        "leaveType": leave_type,
+        "startDate": start_date,
+        "endDate": end_date,
+        "daysRequested": days_requested,
+    }
+    if reason:
+        data["reason"] = reason
+    try:
+        return _ok(_post(f"/v1/employees/{employee_id}/leave", data))
+    except Exception as e:
+        return _err(e)
+
+
+@mcp.tool()
+def update_leave_request(leave_id: str, updates: str) -> str:
+    """Update a leave request (approve, reject, cancel, or modify).
+
+    Args:
+        leave_id: The leave request's public UUID
+        updates: JSON string, e.g. '{"status": "approved"}' or '{"status": "rejected", "rejectionReason": "..."}'
+    """
+    try:
+        data = json.loads(updates)
+        return _ok(_put(f"/v1/leave/{leave_id}", data))
+    except json.JSONDecodeError:
+        return json.dumps({"error": "Invalid JSON in updates parameter"})
+    except Exception as e:
+        return _err(e)
+
+
+@mcp.tool()
+def delete_leave_request(leave_id: str) -> str:
+    """Delete a leave request.
+
+    Args:
+        leave_id: The leave request's public UUID
+    """
+    try:
+        return _ok(_delete(f"/v1/leave/{leave_id}"))
+    except Exception as e:
+        return _err(e)
+
+
+# ── WEBHOOKS ─────────────────────────────────────────────────────────────────
+
+@mcp.tool()
+def list_webhooks(limit: int = 50, skip: int = 0) -> str:
+    """List all registered webhooks.
+
+    Args:
+        limit: Max results (1-100)
+        skip: Offset for pagination
+    """
+    try:
+        return _ok(_get("/v1/webhooks", {"limit": limit, "skip": skip}))
+    except Exception as e:
+        return _err(e)
+
+
+@mcp.tool()
+def create_webhook(
+    name: str,
+    url: str,
+    events: str,
+) -> str:
+    """Create a webhook to receive event notifications.
+
+    Args:
+        name: Webhook name (e.g., "My CRM Integration")
+        url: HTTPS URL to POST events to
+        events: Comma-separated events, e.g. "customer.created,invoice.created".
+                Available: customer.created/updated/deleted, invoice.created/updated/deleted,
+                product.created/updated/deleted, quote.created/updated/deleted,
+                payment.created, employee.created/updated/deleted, leave.created/updated/deleted
+    """
+    event_list = [e.strip() for e in events.split(",") if e.strip()]
+    try:
+        return _ok(_post("/v1/webhooks", {"name": name, "url": url, "events": event_list}))
+    except Exception as e:
+        return _err(e)
+
+
+@mcp.tool()
+def delete_webhook(webhook_id: str) -> str:
+    """Delete a webhook.
+
+    Args:
+        webhook_id: The webhook's public UUID
+    """
+    try:
+        return _ok(_delete(f"/v1/webhooks/{webhook_id}"))
+    except Exception as e:
+        return _err(e)
+
+
+@mcp.tool()
+def test_webhook(webhook_id: str) -> str:
+    """Send a test event to a webhook endpoint.
+
+    Args:
+        webhook_id: The webhook's public UUID
+    """
+    try:
+        return _ok(_post(f"/v1/webhooks/{webhook_id}/test", {}))
+    except Exception as e:
+        return _err(e)
+
+
+# ── STATUS ───────────────────────────────────────────────────────────────────
+
+@mcp.tool()
+def check_status() -> str:
+    """Check Umbra ERP API connectivity and authentication status."""
+    try:
+        api_key = _get_api_key()
+        key_prefix = api_key[:12] + "..." if len(api_key) > 12 else api_key
+        result = _get("/v1/customers", {"limit": 1})
+        return json.dumps({
+            "status": "ok",
+            "base_url": UMBRA_BASE_URL,
+            "api_key_prefix": key_prefix,
+            "customers_accessible": "pagination" in result,
+            "resources": [
+                "customers", "invoices", "products", "quotes",
+                "payments", "employees", "leave_requests", "webhooks",
+            ],
+        }, indent=2)
+    except Exception as e:
+        return json.dumps({"status": "error", "error": str(e)})
+
+
+# ============================================================================
+# Run server
+# ============================================================================
+
+if __name__ == "__main__":
+    mcp.run()
