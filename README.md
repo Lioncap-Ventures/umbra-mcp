@@ -167,7 +167,7 @@ Payloads are signed with HMAC-SHA256 via the `X-Webhook-Signature` header.
 | Environment Variable | Default | Description |
 |---------------------|---------|-------------|
 | `UMBRA_API_KEY` | — | Your Umbra ERP API key (required) |
-| `UMBRA_API_URL` | `https://umbra-erp-api-europenorth1-ynddvnxogq-lz.a.run.app` | API base URL |
+| `UMBRA_API_URL` | `https://umbra-erp-api-europenorth1-wufqavak5a-lz.a.run.app` | API base URL |
 
 ## API Documentation
 

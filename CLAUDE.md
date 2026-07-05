@@ -8,8 +8,8 @@ API key resolved in order:
 1. `UMBRA_API_KEY` environment variable
 2. `~/.claude/scripts/.env` file (UMBRA_API_KEY=...)
 
-**Production URL:** `https://umbra-erp-api-europenorth1-ynddvnxogq-lz.a.run.app` (override with `UMBRA_API_URL` env var)
-**Staging URL:** `https://staging-umbra-erp-api-europenorth1-ynddvnxogq-lz.a.run.app`
+**Production URL:** `https://umbra-erp-api-europenorth1-wufqavak5a-lz.a.run.app` (override with `UMBRA_API_URL` env var)
+**Staging URL:** `https://staging-umbra-erp-api-europenorth1-wufqavak5a-lz.a.run.app`
 
 ## Tools (31 total)
 
