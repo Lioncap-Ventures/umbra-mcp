@@ -1171,6 +1171,96 @@ def create_lead(
         return _err(e)
 
 
+@mcp.tool()
+def update_lead(lead_id: str, updates: str, workspace: str = "primary") -> str:
+    """Update a CRM lead. Pass a JSON string of the fields to change.
+
+    Partial update: only the keys you send are touched. Requires the `leads`
+    permission on the API key.
+
+    Updatable keys: firstName, lastName, email, phone, company, jobTitle,
+    source, status, score, notes, tags (array), customFields (object),
+    leadTemperature, utmSource, utmMedium, utmCampaign, nextFollowUpDate
+    (YYYY-MM-DD or ISO-8601). Any other key is ignored by the API rather than
+    rejected, so check a field name here before relying on it.
+
+    `status` is validated against the LeadStatus enum and a bad value returns
+    400 listing the valid ones. Setting status to "converted" by hand does NOT
+    create a customer — use convert_lead_to_customer for that, or the lead is
+    marked converted with nothing on the other side.
+
+    Args:
+        lead_id: The lead's public UUID
+        updates: JSON string with fields to update, e.g. '{"status": "qualified", "score": 80}'
+        workspace: Target business workspace (default "primary")
+    """
+    try:
+        data = json.loads(updates)
+    except json.JSONDecodeError:
+        return json.dumps({"error": "Invalid JSON in updates parameter"})
+    try:
+        return _ok(_put(f"/v1/leads/{lead_id}", data, workspace))
+    except Exception as e:
+        return _err(e)
+
+
+@mcp.tool()
+def convert_lead_to_customer(
+    lead_id: str,
+    name: str | None = None,
+    company_name: str | None = None,
+    email: str | None = None,
+    phone: str | None = None,
+    currency: str | None = None,
+    idempotency_key: str | None = None,
+    workspace: str = "primary",
+) -> str:
+    """Convert a CRM lead into a customer and mark the lead `converted`.
+
+    SIDE EFFECTS: creates a customer record and writes `converted` back onto
+    the lead. Requires the `leads` permission.
+
+    Every argument except lead_id is optional and falls back to the lead's own
+    value, so the usual call is just the lead id.
+
+    Safe to retry. An already-converted lead returns its EXISTING customer with
+    `alreadyConverted: true` and HTTP 200 rather than creating a second one;
+    converting twice would split one relationship across two customer records
+    and scatter that customer's invoices between them.
+
+    Returns {"data": {id, name, email, phone, leadId}, "alreadyConverted": bool}
+    where `id` is the customer's public UUID (feed that to get_customer /
+    create_invoice) and `leadId` is the lead's public UUID.
+
+    Args:
+        lead_id: The lead's public UUID
+        name: Override the customer's display name (default: lead's full name)
+        company_name: Override company name (default: the lead's company)
+        email: Override email (default: the lead's email)
+        phone: Override phone (default: the lead's phone or mobile)
+        currency: Currency code for the new customer (default: the business currency)
+        idempotency_key: Reuse the same key to replay a timed-out call instead
+            of re-running it. Auto-generated when omitted.
+        workspace: Target business workspace (default "primary")
+    """
+    data: dict[str, Any] = {}
+    if name:
+        data["name"] = name
+    if company_name:
+        data["companyName"] = company_name
+    if email:
+        data["email"] = email
+    if phone:
+        data["phone"] = phone
+    if currency:
+        data["currency"] = currency
+    try:
+        return _ok(_post(f"/v1/leads/{lead_id}/convert", data, workspace,
+                         _idem(idempotency_key)))
+    except Exception as e:
+        return _err(e)
+
+
 # ── ACTIVITIES (CRM) ─────────────────────────────────────────────────────────
 
 @mcp.tool()
