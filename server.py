@@ -1652,6 +1652,897 @@ def test_webhook(webhook_id: str, workspace: str = "primary") -> str:
         return _err(e)
 
 
+# ── RECEIPTS (customer money in) ─────────────────────────────────────────────
+# Same underlying rows as list_payments/get_payment. Exposed under their own
+# names because "receipt" is the document a user asks about.
+
+@mcp.tool()
+def list_receipts(limit: int = 50, skip: int = 0, workspace: str = "primary") -> str:
+    """List customer receipts (money in), newest page first.
+
+    Requires the `payments` permission. Reads the same rows as list_payments;
+    both names are live and return identical shapes.
+
+    Each receipt carries: id (public UUID), receiptNumber, receiptDate and
+    paymentDate (YYYY-MM-DD), amount in DOLLARS, currency, status
+    (draft|issued|paid|completed|final|voided), paymentMethod (cash,
+    credit_card, ecocash, mobile_money, bank_transfer, other),
+    paymentReference, customerId (public UUID or null), customerName,
+    invoiceId (public UUID or null), invoiceNumber, unallocatedAmount in
+    DOLLARS, onAccount, dateCreated/timeUpdated (ISO-8601 UTC with Z).
+
+    `onAccount: true` means the receipt is not applied to any invoice;
+    `unallocatedAmount` is how much of it is still unapplied.
+
+    Args:
+        limit: Max results (1-200, default 50)
+        skip: Offset for pagination
+        workspace: Target business workspace (default "primary")
+    """
+    try:
+        return _ok(_get("/v1/receipts", {"limit": limit, "skip": skip}, workspace))
+    except Exception as e:
+        return _err(e)
+
+
+@mcp.tool()
+def get_receipt(receipt_id: str, workspace: str = "primary") -> str:
+    """Get one customer receipt by its public UUID.
+
+    Requires the `payments` permission. Same shape as list_receipts, with
+    `amount` and `unallocatedAmount` in DOLLARS.
+
+    Args:
+        receipt_id: The receipt's public UUID (the `id` from list_receipts)
+        workspace: Target business workspace (default "primary")
+    """
+    try:
+        return _ok(_get(f"/v1/receipts/{receipt_id}", workspace=workspace))
+    except Exception as e:
+        return _err(e)
+
+
+# ── INVOICE PAY LINK ─────────────────────────────────────────────────────────
+
+@mcp.tool()
+def get_invoice_pay_link(invoice_id: str, workspace: str = "primary") -> str:
+    """Get (or mint) the customer-facing card pay link for an invoice.
+
+    Requires the `invoices` permission. Mints a token on first call, reuses a
+    live one afterwards so a link already given to a customer stays valid, and
+    regenerates a lapsed one. Token TTL is 30 days.
+
+    NEVER construct a pay URL yourself — the token and its eligibility gates
+    are server-owned. Read `payUrl` here or off the invoice object.
+
+    Availability is not an error. When the rail is unavailable this returns
+    HTTP 200 with `available: false`, `payUrl: null` and a `reason` you should
+    report verbatim, one of:
+      - "Card payments are not enabled for this business" — the tenant is not
+        opted in. The tenant CANNOT self-enable; a Lioncap admin must do it,
+        because the money lands in the Lioncap merchant account.
+      - "Pay links are USD only; this invoice is ZWG" — currency gate.
+
+    When available: {invoiceId, invoiceNumber, payUrl, available: true,
+    amountDue (DOLLARS), currency, expiresAt (ISO-8601 UTC with Z)}.
+
+    Args:
+        invoice_id: The invoice's public UUID
+        workspace: Target business workspace (default "primary")
+    """
+    try:
+        result = _get(f"/v1/invoices/{invoice_id}/pay-link", workspace=workspace)
+        data = result.get("data") if isinstance(result, dict) else None
+        if isinstance(data, dict) and not data.get("available"):
+            return _ok({
+                "available": False,
+                "payUrl": None,
+                "reason": data.get("reason", "Pay link unavailable"),
+                "invoiceId": data.get("invoiceId"),
+                "note": "Not an error. Report the reason to the user as written.",
+            })
+        return _ok(result)
+    except Exception as e:
+        return _err(e)
+
+
+# ── QUOTE -> INVOICE ─────────────────────────────────────────────────────────
+
+@mcp.tool()
+def convert_quote_to_invoice(
+    quote_id: str,
+    idempotency_key: str | None = None,
+    workspace: str = "primary",
+) -> str:
+    """Convert a quote into a numbered invoice.
+
+    SIDE EFFECTS: mints an invoice from the quote's line items and marks the
+    quote `accepted`. Requires the `quotes` permission.
+
+    Safe to retry. A quote already converted returns its EXISTING invoice with
+    HTTP 200 and `alreadyConverted: true` rather than erroring. It never mints
+    a second invoice: that would draw another number from the gapless sequence
+    and post the same sale's revenue twice.
+
+    Returns {"data": <full invoice object>, "alreadyConverted": bool}. The
+    invoice carries publicId, invoiceNumber, status, invoiceDate, dueDate,
+    subtotal / taxAmount / total / amountPaid / balanceDue in DOLLARS,
+    currency, and payUrl (null unless card payments are live for the tenant
+    and the invoice is USD).
+
+    409 means the quote was converted but its invoice has since been deleted.
+
+    Args:
+        quote_id: The quote's public UUID
+        idempotency_key: Reuse the same key to replay a timed-out call instead
+            of re-running it. Auto-generated when omitted.
+        workspace: Target business workspace (default "primary")
+    """
+    try:
+        return _ok(_post(f"/v1/quotes/{quote_id}/convert", {}, workspace,
+                         _idem(idempotency_key)))
+    except Exception as e:
+        return _err(e)
+
+
+# ── RECURRING INVOICES ───────────────────────────────────────────────────────
+
+@mcp.tool()
+def list_recurring_invoices(
+    status: str | None = None,
+    limit: int = 50,
+    skip: int = 0,
+    workspace: str = "primary",
+) -> str:
+    """List recurring-invoice templates (the schedules, not the invoices they emit).
+
+    Requires the `invoices` permission.
+
+    Each template: id (public UUID), customerId, title, frequency, status,
+    startDate / endDate / nextInvoiceDate (YYYY-MM-DD), dayOfMonth, total in
+    DOLLARS, currency, autoSend, invoicesGenerated, lastGeneratedAt (ISO-8601
+    UTC with Z), paymentTermsDays, dateCreated.
+
+    WARNING: `customerId` on this shape is a NUMERIC row id, not a public UUID.
+    Do not feed it to get_customer or any path parameter.
+
+    Args:
+        status: Filter by status (active, paused, completed, cancelled)
+        limit: Max results (1-200, default 50)
+        skip: Offset for pagination
+        workspace: Target business workspace (default "primary")
+    """
+    params: dict[str, Any] = {"limit": limit, "skip": skip}
+    if status:
+        params["status"] = status
+    try:
+        return _ok(_get("/v1/recurring-invoices", params, workspace))
+    except Exception as e:
+        return _err(e)
+
+
+@mcp.tool()
+def create_recurring_invoice(
+    customer_id: str,
+    title: str,
+    frequency: str,
+    start_date: str,
+    total: float,
+    subtotal: float | None = None,
+    tax_amount: float | None = None,
+    currency: str = "USD",
+    end_date: str | None = None,
+    day_of_month: int | None = None,
+    payment_terms_days: int = 14,
+    auto_send: bool = False,
+    notes: str | None = None,
+    terms: str | None = None,
+    reference: str | None = None,
+    idempotency_key: str | None = None,
+    workspace: str = "primary",
+) -> str:
+    """Create a recurring-invoice template that emits real invoices on a schedule.
+
+    SIDE EFFECTS: from `start_date` onwards this bills the customer on every
+    sweep without further approval, and `auto_send=True` emails each invoice.
+    The FIRST run is `start_date` itself, so a template starting today fires on
+    today's sweep. Requires the `invoices` permission.
+
+    All money arguments are in DOLLARS (e.g. 500.00, never 50000).
+
+    Args:
+        customer_id: Customer public UUID
+        title: Template title, e.g. "Monthly retainer"
+        frequency: weekly, biweekly, monthly, quarterly, semi_annual, or annual
+        start_date: First invoice date (YYYY-MM-DD). Fires on this date.
+        total: Invoice total in DOLLARS
+        subtotal: Subtotal in DOLLARS (defaults to `total`)
+        tax_amount: Tax in DOLLARS (default 0)
+        currency: Currency code (default USD)
+        end_date: Stop after this date (YYYY-MM-DD); null runs indefinitely
+        day_of_month: Day of month to bill on, for monthly-and-longer frequencies
+        payment_terms_days: Days until each generated invoice is due (default 14)
+        auto_send: Email each generated invoice to the customer automatically
+        notes: Notes copied onto each generated invoice
+        terms: Terms copied onto each generated invoice
+        reference: Your own reference for the template
+        idempotency_key: Reuse the same key to replay a timed-out call instead
+            of creating a second schedule. Auto-generated when omitted.
+        workspace: Target business workspace (default "primary")
+    """
+    data: dict[str, Any] = {
+        "customerId": customer_id,
+        "title": title,
+        "frequency": frequency,
+        "startDate": start_date,
+        "total": total,
+        "subtotal": total if subtotal is None else subtotal,
+        "taxAmount": 0 if tax_amount is None else tax_amount,
+        "currency": currency,
+        "paymentTermsDays": payment_terms_days,
+        "autoSend": auto_send,
+    }
+    if end_date:
+        data["endDate"] = end_date
+    if day_of_month is not None:
+        data["dayOfMonth"] = day_of_month
+    if notes:
+        data["notes"] = notes
+    if terms:
+        data["terms"] = terms
+    if reference:
+        data["reference"] = reference
+    try:
+        return _ok(_post("/v1/recurring-invoices", data, workspace, _idem(idempotency_key)))
+    except Exception as e:
+        return _err(e)
+
+
+@mcp.tool()
+def update_recurring_invoice(recurring_id: str, updates: str, workspace: str = "primary") -> str:
+    """Update a recurring-invoice template. Pass a JSON string of fields to change.
+
+    Requires the `invoices` permission. Partial update: only the keys you send
+    are touched.
+
+    Accepted keys: title, reference, notes, terms, dayOfMonth, status,
+    paymentTermsDays, frequency, endDate, nextInvoiceDate, autoSend, total.
+    `total` is in DOLLARS. Dates are YYYY-MM-DD.
+
+    Set `status` to "paused" to stop the schedule emitting without deleting its
+    history, "active" to resume, "cancelled" to stop it for good.
+
+    NOTE: sending an explicit null for endDate / nextInvoiceDate / frequency /
+    dayOfMonth does NOT clear the stored value — the API skips null on those
+    fields. There is no way to un-set them through this endpoint.
+
+    Args:
+        recurring_id: The template's public UUID
+        updates: JSON string, e.g. '{"status": "paused"}' or '{"total": 750.00}'
+        workspace: Target business workspace (default "primary")
+    """
+    try:
+        data = json.loads(updates)
+    except json.JSONDecodeError:
+        return json.dumps({"error": "Invalid JSON in updates parameter"})
+    try:
+        return _ok(_put(f"/v1/recurring-invoices/{recurring_id}", data, workspace))
+    except Exception as e:
+        return _err(e)
+
+
+# ── RECURRING QUOTES ─────────────────────────────────────────────────────────
+
+_RECURRING_QUOTE_ACTIONS = {
+    "pause": "paused",
+    "resume": "active",
+    "cancel": "cancelled",
+    "end": "ended",
+}
+
+
+@mcp.tool()
+def list_recurring_quotes(
+    status: str | None = None,
+    limit: int = 50,
+    skip: int = 0,
+    workspace: str = "primary",
+) -> str:
+    """List recurring-quote templates (the schedules, not the quotes they emit).
+
+    Requires the `quotes` permission.
+
+    Each template: id (public UUID), customerId, title, frequency, status,
+    startDate / endDate / nextQuoteDate (YYYY-MM-DD), dayOfMonth, total in
+    DOLLARS, currency, autoSend, quotesGenerated, lastGeneratedAt (ISO-8601 UTC
+    with Z), lastGeneratedQuoteId, validityDays, dateCreated.
+
+    `validityDays` is canonical: how long each generated quote stays open.
+    `paymentTermsDays` is accepted on write as an alias but is NEVER returned
+    on a recurring quote — do not read it off this shape.
+
+    Generating a quote books nothing. A quote is an offer, not a receivable;
+    money only moves when it is converted to an invoice and paid.
+
+    WARNING: `customerId` and `lastGeneratedQuoteId` here are NUMERIC row ids,
+    not public UUIDs. Do not feed them to a path parameter.
+
+    Args:
+        status: Filter by status (active, paused, cancelled, ended)
+        limit: Max results (1-200, default 50)
+        skip: Offset for pagination
+        workspace: Target business workspace (default "primary")
+    """
+    params: dict[str, Any] = {"limit": limit, "skip": skip}
+    if status:
+        params["status"] = status
+    try:
+        return _ok(_get("/v1/recurring-quotes", params, workspace))
+    except Exception as e:
+        return _err(e)
+
+
+@mcp.tool()
+def create_recurring_quote(
+    customer_id: str,
+    title: str,
+    frequency: str,
+    start_date: str,
+    total: float,
+    subtotal: float | None = None,
+    tax_amount: float | None = None,
+    currency: str = "USD",
+    end_date: str | None = None,
+    day_of_month: int | None = None,
+    validity_days: int = 30,
+    auto_send: bool = False,
+    notes: str | None = None,
+    terms: str | None = None,
+    reference: str | None = None,
+    idempotency_key: str | None = None,
+    workspace: str = "primary",
+) -> str:
+    """Create a recurring-quote template that emits quotes on a schedule.
+
+    SIDE EFFECTS: emits a quote on every sweep from `start_date` onwards, and
+    `auto_send=True` emails each one to the customer. The FIRST run is
+    `start_date` itself. Requires the `quotes` permission.
+
+    All money arguments are in DOLLARS. Generating a quote posts nothing to the
+    ledger — a quote is an offer, not a receivable.
+
+    Args:
+        customer_id: Customer public UUID
+        title: Template title, e.g. "Quarterly proposal"
+        frequency: weekly, biweekly, monthly, quarterly, semi_annual, or annual
+        start_date: First quote date (YYYY-MM-DD). Fires on this date.
+        total: Quote total in DOLLARS
+        subtotal: Subtotal in DOLLARS (defaults to `total`)
+        tax_amount: Tax in DOLLARS (default 0)
+        currency: Currency code (default USD)
+        end_date: Stop after this date (YYYY-MM-DD); null runs indefinitely
+        day_of_month: Day of month to generate on, for monthly-and-longer frequencies
+        validity_days: How long each GENERATED quote stays open before expiring
+            (default 30). This is the canonical field; paymentTermsDays is only
+            an input alias and is never returned.
+        auto_send: Email each generated quote to the customer automatically
+        notes: Notes copied onto each generated quote
+        terms: Terms copied onto each generated quote
+        reference: Your own reference for the template
+        idempotency_key: Reuse the same key to replay a timed-out call instead
+            of creating a second schedule. Auto-generated when omitted.
+        workspace: Target business workspace (default "primary")
+    """
+    data: dict[str, Any] = {
+        "customerId": customer_id,
+        "title": title,
+        "frequency": frequency,
+        "startDate": start_date,
+        "total": total,
+        "subtotal": total if subtotal is None else subtotal,
+        "taxAmount": 0 if tax_amount is None else tax_amount,
+        "currency": currency,
+        "validityDays": validity_days,
+        "autoSend": auto_send,
+    }
+    if end_date:
+        data["endDate"] = end_date
+    if day_of_month is not None:
+        data["dayOfMonth"] = day_of_month
+    if notes:
+        data["notes"] = notes
+    if terms:
+        data["terms"] = terms
+    if reference:
+        data["reference"] = reference
+    try:
+        return _ok(_post("/v1/recurring-quotes", data, workspace, _idem(idempotency_key)))
+    except Exception as e:
+        return _err(e)
+
+
+@mcp.tool()
+def update_recurring_quote(recurring_id: str, updates: str, workspace: str = "primary") -> str:
+    """Update a recurring-quote template. Pass a JSON string of fields to change.
+
+    Requires the `quotes` permission. Partial update: only the keys you send
+    are touched.
+
+    Accepted keys: title, reference, notes, terms, dayOfMonth, status,
+    frequency, endDate, nextQuoteDate, autoSend, total, and validityDays (or
+    its input alias paymentTermsDays). `total` is in DOLLARS; dates are
+    YYYY-MM-DD. Omitting both validity keys leaves the stored value alone
+    rather than resetting it to the 30-day default.
+
+    For pause / resume / cancel prefer set_recurring_quote_status, which
+    validates the status string; this endpoint stores `status` verbatim into a
+    free-text column, so a typo is accepted silently and the schedule then
+    matches no filter.
+
+    NOTE: an explicit null for endDate / nextQuoteDate / frequency /
+    dayOfMonth does NOT clear the stored value — the API skips null on those.
+
+    Args:
+        recurring_id: The template's public UUID
+        updates: JSON string, e.g. '{"validityDays": 45, "total": 1800.00}'
+        workspace: Target business workspace (default "primary")
+    """
+    try:
+        data = json.loads(updates)
+    except json.JSONDecodeError:
+        return json.dumps({"error": "Invalid JSON in updates parameter"})
+    try:
+        return _ok(_put(f"/v1/recurring-quotes/{recurring_id}", data, workspace))
+    except Exception as e:
+        return _err(e)
+
+
+@mcp.tool()
+def set_recurring_quote_status(
+    recurring_id: str,
+    action: str,
+    workspace: str = "primary",
+) -> str:
+    """Pause, resume, cancel or end a recurring-quote schedule.
+
+    SIDE EFFECT: changes whether the template emits quotes on the next sweep.
+    Requires the `quotes` permission.
+
+    Actions: "pause" -> paused (stops emitting, keeps history and can be
+    resumed), "resume" -> active, "cancel" -> cancelled (stopped for good),
+    "end" -> ended (the schedule ran its course).
+
+    The status column is free text server-side, so an unrecognised value would
+    be stored silently and leave the schedule matching no status filter. This
+    tool rejects anything outside the four actions rather than writing it.
+
+    Recurring INVOICE templates have no equivalent action tool — use
+    update_recurring_invoice with '{"status": "paused"}' (their status set is
+    active, paused, completed, cancelled).
+
+    Args:
+        recurring_id: The template's public UUID
+        action: One of pause, resume, cancel, end
+        workspace: Target business workspace (default "primary")
+    """
+    key = (action or "").strip().lower()
+    if key not in _RECURRING_QUOTE_ACTIONS:
+        return json.dumps({
+            "error": f"Unknown action '{action}'",
+            "validActions": sorted(_RECURRING_QUOTE_ACTIONS),
+        })
+    try:
+        return _ok(_put(f"/v1/recurring-quotes/{recurring_id}",
+                        {"status": _RECURRING_QUOTE_ACTIONS[key]}, workspace))
+    except Exception as e:
+        return _err(e)
+
+
+@mcp.tool()
+def recurring_quote_history(recurring_id: str, workspace: str = "primary") -> str:
+    """Generation history for one recurring-quote schedule.
+
+    Requires the `quotes` permission.
+
+    LIMITATION, read before relying on this: the public API exposes NO endpoint
+    that lists the individual quote documents a schedule produced, and no
+    get-by-id for a recurring quote either. This tool pages
+    /v1/recurring-quotes to find the template and returns its generation
+    counters: quotesGenerated, lastGeneratedAt (ISO-8601 UTC with Z),
+    lastGeneratedQuoteId, nextQuoteDate, status, frequency, validityDays and
+    total (DOLLARS).
+
+    `lastGeneratedQuoteId` is a NUMERIC row id, NOT a public UUID — get_quote
+    will not accept it. To see the actual documents, call list_quotes and match
+    on customer and date.
+
+    Args:
+        recurring_id: The template's public UUID
+        workspace: Target business workspace (default "primary")
+    """
+    try:
+        page, limit, scanned = 0, 200, 0
+        while page < 5:
+            result = _get("/v1/recurring-quotes",
+                          {"limit": limit, "skip": page * limit}, workspace)
+            rows = result.get("data") or []
+            scanned += len(rows)
+            for row in rows:
+                if row.get("id") == recurring_id:
+                    return _ok({
+                        "id": row.get("id"),
+                        "title": row.get("title"),
+                        "status": row.get("status"),
+                        "frequency": row.get("frequency"),
+                        "quotesGenerated": row.get("quotesGenerated"),
+                        "lastGeneratedAt": row.get("lastGeneratedAt"),
+                        "lastGeneratedQuoteId": row.get("lastGeneratedQuoteId"),
+                        "nextQuoteDate": row.get("nextQuoteDate"),
+                        "validityDays": row.get("validityDays"),
+                        "total": row.get("total"),
+                        "currency": row.get("currency"),
+                        "note": (
+                            "Counters only. The API exposes no list of the quote "
+                            "documents this schedule generated, and "
+                            "lastGeneratedQuoteId is a numeric row id that get_quote "
+                            "cannot take."
+                        ),
+                    })
+            if len(rows) < limit:
+                break
+            page += 1
+        return json.dumps({
+            "error": "Recurring quote not found",
+            "recurringId": recurring_id,
+            "scanned": scanned,
+        })
+    except Exception as e:
+        return _err(e)
+
+
+# ── REPORTS ──────────────────────────────────────────────────────────────────
+
+@mcp.tool()
+def aged_receivables(
+    as_of: str | None = None,
+    customer_id: str | None = None,
+    workspace: str = "primary",
+) -> str:
+    """Outstanding customer receivables bucketed by how far PAST DUE they are.
+
+    Requires the `reports` permission (grantable only from 2026-08-29; an older
+    key 403s and must be re-minted).
+
+    Buckets are days past the DUE date, not days since issue: an invoice on
+    30-day terms issued 20 days ago is `current`, not 30 days old. Boundaries:
+    current = due today or later, days1To30 = 1-30 days late, then 31-60,
+    61-90, days90Plus = 91+.
+
+    Excludes draft (never issued), cancelled (reversed), paid, and bad_debt
+    (already written off) — none of them is money anyone expects to collect.
+
+    Returns buckets and byCustomer rows in DOLLARS, plus `bucketsCents` and
+    `totalCents` in integer CENTS. USE THE CENTS FIELDS for any comparison or
+    summation and the dollar fields for display only; float sums drift.
+    `byCustomer` is sorted by total descending and its `customerId` IS a public
+    UUID.
+
+    Args:
+        as_of: Report date (YYYY-MM-DD, default today). Ageing is measured
+            against this date, so pass a month-end to reproduce a past report.
+        customer_id: Restrict to one customer's public UUID
+        workspace: Target business workspace (default "primary")
+    """
+    params: dict[str, Any] = {}
+    if as_of:
+        params["asOf"] = as_of
+    if customer_id:
+        params["customerId"] = customer_id
+    try:
+        return _ok(_get("/v1/reports/aged-receivables", params, workspace))
+    except Exception as e:
+        return _err(e)
+
+
+@mcp.tool()
+def customer_statement(
+    customer_id: str,
+    start_date: str | None = None,
+    end_date: str | None = None,
+    workspace: str = "primary",
+) -> str:
+    """Statement of account for one customer: invoices, receipts, closing balance.
+
+    Requires the `customers` permission.
+
+    openingBalance + totalInvoiced - totalPaid = closingBalance always holds.
+    Without `start_date` the opening balance is 0.00 and the statement covers
+    all history. `closingBalance` can be NEGATIVE when the customer is in
+    credit — do not clamp it to zero. Draft and cancelled invoices are excluded.
+
+    Money fields are DOLLARS, with `closingBalanceCents` in integer CENTS for
+    exact arithmetic. Dates are YYYY-MM-DD.
+
+    WARNING: `payments[].invoiceId` is a NUMERIC row id here, not a public
+    UUID. `invoices[].id` and `payments[].id` ARE public UUIDs.
+
+    Args:
+        customer_id: The customer's public UUID
+        start_date: Period start (YYYY-MM-DD). Omit for all history with a
+            0.00 opening balance.
+        end_date: Period end (YYYY-MM-DD, default today)
+        workspace: Target business workspace (default "primary")
+    """
+    params: dict[str, Any] = {}
+    if start_date:
+        params["startDate"] = start_date
+    if end_date:
+        params["endDate"] = end_date
+    try:
+        return _ok(_get(f"/v1/customers/{customer_id}/statement", params, workspace))
+    except Exception as e:
+        return _err(e)
+
+
+# ── BILLS (supplier money out) ───────────────────────────────────────────────
+
+@mcp.tool()
+def list_bills(
+    status: str | None = None,
+    limit: int = 50,
+    skip: int = 0,
+    workspace: str = "primary",
+) -> str:
+    """List supplier bills (accounts payable).
+
+    Requires the `bills` permission (grantable only from 2026-08-29; an older
+    key 403s and must be re-minted).
+
+    Each bill: id (public UUID), billNumber, vendorBillNumber, vendorId,
+    vendorName, reference, status, billDate / dueDate (YYYY-MM-DD), subtotal,
+    taxAmount, total, amountPaid, balanceDue all in DOLLARS, currency,
+    dateCreated (ISO-8601 UTC with Z).
+
+    WARNING: `vendorId` in the RESPONSE is a NUMERIC row id, while create_bill
+    takes a vendor PUBLIC UUID. Do not round-trip the response value.
+
+    Args:
+        status: Filter by status (draft, pending, approved, partial, paid,
+            overdue, cancelled)
+        limit: Max results (1-200, default 50)
+        skip: Offset for pagination
+        workspace: Target business workspace (default "primary")
+    """
+    params: dict[str, Any] = {"limit": limit, "skip": skip}
+    if status:
+        params["status"] = status
+    try:
+        return _ok(_get("/v1/bills", params, workspace))
+    except Exception as e:
+        return _err(e)
+
+
+@mcp.tool()
+def get_bill(bill_id: str, workspace: str = "primary") -> str:
+    """Get one supplier bill by its public UUID.
+
+    Requires the `bills` permission. Money fields are DOLLARS. Check
+    `balanceDue` before calling record_bill_payment: an overpayment is rejected,
+    not clamped.
+
+    Args:
+        bill_id: The bill's public UUID
+        workspace: Target business workspace (default "primary")
+    """
+    try:
+        return _ok(_get(f"/v1/bills/{bill_id}", workspace=workspace))
+    except Exception as e:
+        return _err(e)
+
+
+@mcp.tool()
+def create_bill(
+    vendor_id: str,
+    total: float,
+    bill_date: str | None = None,
+    due_date: str | None = None,
+    subtotal: float | None = None,
+    tax_amount: float | None = None,
+    vendor_bill_number: str | None = None,
+    bill_number: str | None = None,
+    reference: str | None = None,
+    currency: str = "USD",
+    notes: str | None = None,
+    idempotency_key: str | None = None,
+    workspace: str = "primary",
+) -> str:
+    """Create a supplier bill (a payable the business owes).
+
+    SIDE EFFECTS: records a liability. Requires the `bills` permission.
+    The bill starts `status: "pending"` with amountPaid 0 and balanceDue equal
+    to `total`. Recording money against it is a separate call
+    (record_bill_payment).
+
+    All money arguments are in DOLLARS (2.33 means two dollars thirty-three).
+
+    Args:
+        vendor_id: The vendor's PUBLIC UUID (required; 400 without it). Note the
+            response returns a numeric vendorId — do not feed that back here.
+        total: Bill total in DOLLARS. Must be greater than zero.
+        bill_date: Bill date (YYYY-MM-DD, default today)
+        due_date: Payment due date (YYYY-MM-DD)
+        subtotal: Subtotal in DOLLARS (defaults to `total`)
+        tax_amount: Tax in DOLLARS (default 0)
+        vendor_bill_number: The supplier's own invoice number, e.g. "INV-9912"
+        bill_number: Your internal bill number. Auto-generated when omitted;
+            let it auto-generate unless you are migrating existing records.
+        reference: Your own reference
+        currency: Currency code (default USD)
+        notes: Free-text notes
+        idempotency_key: Reuse the same key to replay a timed-out call instead
+            of booking the same liability twice. Auto-generated when omitted.
+        workspace: Target business workspace (default "primary")
+    """
+    data: dict[str, Any] = {
+        "vendorId": vendor_id,
+        "total": total,
+        "subtotal": total if subtotal is None else subtotal,
+        "taxAmount": 0 if tax_amount is None else tax_amount,
+        "currency": currency,
+    }
+    if bill_date:
+        data["billDate"] = bill_date
+    if due_date:
+        data["dueDate"] = due_date
+    if vendor_bill_number:
+        data["vendorBillNumber"] = vendor_bill_number
+    if bill_number:
+        data["billNumber"] = bill_number
+    if reference:
+        data["reference"] = reference
+    if notes:
+        data["notes"] = notes
+    try:
+        return _ok(_post("/v1/bills", data, workspace, _idem(idempotency_key)))
+    except Exception as e:
+        return _err(e)
+
+
+@mcp.tool()
+def record_bill_payment(
+    bill_id: str,
+    amount: float,
+    payment_date: str | None = None,
+    payment_method: str | None = None,
+    reference: str | None = None,
+    memo: str | None = None,
+    idempotency_key: str | None = None,
+    workspace: str = "primary",
+) -> str:
+    """Record a payment against a supplier bill. THIS MOVES REAL MONEY OUT.
+
+    SIDE EFFECTS: creates the payment, updates the bill's amountPaid /
+    balanceDue / status, and posts the DR Accounts Payable / CR Cash journal
+    entry. Requires the `bills` permission.
+
+    `amount` is in DOLLARS end to end — send 2.33 for two dollars thirty-three.
+    Do NOT convert to cents: this is the one money column in the schema stored
+    in dollars, and the API normalises it for you either way, so a
+    cents-converted figure would pay the supplier 100x.
+
+    OVERPAYMENT IS REJECTED WITH 400, not clamped:
+    "Payment of 250.0 exceeds the outstanding balance of 233.0". Read
+    `balanceDue` with get_bill first. (Customer receipts behave the opposite
+    way — an overpayment there is recorded and flagged, because that cash has
+    already arrived. Supplier money has not left yet and an excess is almost
+    always a typo.)
+
+    Returns {"data": {id, billId, amount, paymentDate, paymentMethod, bill:
+    <updated bill>}}.
+
+    Args:
+        bill_id: The bill's public UUID
+        amount: Payment amount in DOLLARS. Must be > 0 and <= the bill's balanceDue.
+        payment_date: Payment date (YYYY-MM-DD, default today)
+        payment_method: e.g. bank_transfer, cash, credit_card, ecocash, mobile_money
+        reference: External reference, e.g. "MasterCard ...7305"
+        memo: Free-text memo, e.g. "Meta ads Aug balance"
+        idempotency_key: Reuse the same key to replay a timed-out call instead
+            of paying the supplier twice. Auto-generated when omitted.
+        workspace: Target business workspace (default "primary")
+    """
+    data: dict[str, Any] = {"amount": amount}
+    if payment_date:
+        data["paymentDate"] = payment_date
+    if payment_method:
+        data["paymentMethod"] = payment_method
+    if reference:
+        data["reference"] = reference
+    if memo:
+        data["memo"] = memo
+    try:
+        return _ok(_post(f"/v1/bills/{bill_id}/payments", data, workspace,
+                         _idem(idempotency_key)))
+    except Exception as e:
+        return _err(e)
+
+
+# ── JOURNAL ENTRIES (read-only) ──────────────────────────────────────────────
+# Deliberately no create/update/delete. Entries are posted by auto_journal from
+# real events (invoice issued, invoice paid, bill paid); a hand-made entry
+# would be a figure in the ledger with no document behind it.
+
+@mcp.tool()
+def list_journal_entries(
+    start_date: str | None = None,
+    end_date: str | None = None,
+    status: str | None = None,
+    limit: int = 50,
+    skip: int = 0,
+    workspace: str = "primary",
+) -> str:
+    """List general-ledger journal entries, newest first. READ ONLY.
+
+    Requires the `journal` permission (grantable only from 2026-08-29; an older
+    key 403s and must be re-minted).
+
+    Each entry: id (public UUID), entryNumber, entryType (standard, adjusting,
+    closing, reversing, opening), status, entryDate (YYYY-MM-DD), description,
+    reference, sourceType, sourceId, totalDebit / totalCredit in DOLLARS,
+    currency, isReversed, postedAt / dateCreated (ISO-8601 UTC with Z). Call
+    get_journal_entry for the debit/credit lines.
+
+    Only `posted` entries affect the ledger. Statuses: draft, pending,
+    approved, posted, rejected, reversed.
+
+    WARNING: `sourceId` is a NUMERIC row id of the source document, not a
+    public UUID — it cannot be passed to get_invoice or get_bill.
+
+    There is no write path by design. Do not look for one.
+
+    Args:
+        start_date: Only entries on/after this date (YYYY-MM-DD)
+        end_date: Only entries on/before this date (YYYY-MM-DD)
+        status: Filter by status (posted, draft, pending, approved, rejected, reversed)
+        limit: Max results (1-200, default 50)
+        skip: Offset for pagination
+        workspace: Target business workspace (default "primary")
+    """
+    params: dict[str, Any] = {"limit": limit, "skip": skip}
+    if start_date:
+        params["startDate"] = start_date
+    if end_date:
+        params["endDate"] = end_date
+    if status:
+        params["status"] = status
+    try:
+        return _ok(_get("/v1/journal-entries", params, workspace))
+    except Exception as e:
+        return _err(e)
+
+
+@mcp.tool()
+def get_journal_entry(entry_id: str, workspace: str = "primary") -> str:
+    """Get one journal entry including its debit/credit lines. READ ONLY.
+
+    Requires the `journal` permission. Same shape as list_journal_entries plus
+    a `lines` array of {accountId, accountNumber, description, debit, credit}
+    with debit/credit in DOLLARS.
+
+    `lines[].accountId` is a NUMERIC chart-of-accounts row id, not a public
+    UUID. In a balanced entry the line debits equal the line credits and both
+    equal totalDebit / totalCredit.
+
+    Args:
+        entry_id: The journal entry's public UUID
+        workspace: Target business workspace (default "primary")
+    """
+    try:
+        return _ok(_get(f"/v1/journal-entries/{entry_id}", workspace=workspace))
+    except Exception as e:
+        return _err(e)
+
+
 # ── WORKSPACES / STATUS ──────────────────────────────────────────────────────
 
 @mcp.tool()
