@@ -1,0 +1,292 @@
+"""Offline request-shape checks for the Umbra MCP mutation tools.
+
+Asserts the exact HTTP method, path, headers and JSON body each write tool
+sends, against the public API contract. No network, no API key, no database:
+httpx.Client is replaced with a recorder, so these run anywhere and can be
+used to verify a mutation tool without pointing it at a live business.
+
+Run:  ../.venv/bin/python test_request_shapes.py
+"""
+
+from __future__ import annotations
+
+import json
+import sys
+import uuid
+
+import server
+
+FAKE_KEY = "usk_test_offline"
+RECORDED: list[dict] = []
+FAILURES: list[str] = []
+
+
+class _FakeResponse:
+    status_code = 200
+
+    def __init__(self, payload):
+        self._payload = payload
+
+    def json(self):
+        return self._payload
+
+    def raise_for_status(self):
+        return None
+
+
+class _FakeClient:
+    """Stands in for httpx.Client and records every request instead of sending it."""
+
+    def __init__(self, *_args, **_kwargs):
+        pass
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_exc):
+        return False
+
+    def _record(self, method, url, headers=None, json=None, params=None):
+        RECORDED.append({
+            "method": method,
+            "url": url,
+            "path": url.split(".app", 1)[-1] if ".app" in url else url.split("://", 1)[-1].split("/", 1)[-1],
+            "headers": headers or {},
+            "body": json,
+            "params": params or {},
+        })
+        return _FakeResponse({"data": {"id": "fake", "items": []}})
+
+    def get(self, url, headers=None, params=None):
+        return self._record("GET", url, headers, None, params)
+
+    def post(self, url, headers=None, json=None):
+        return self._record("POST", url, headers, json)
+
+    def put(self, url, headers=None, json=None):
+        return self._record("PUT", url, headers, json)
+
+    def delete(self, url, headers=None):
+        return self._record("DELETE", url, headers)
+
+
+def check(label: str, condition: bool, detail: str = "") -> None:
+    if condition:
+        print(f"  PASS  {label}")
+    else:
+        FAILURES.append(label)
+        print(f"  FAIL  {label}  {detail}")
+
+
+def last() -> dict:
+    return RECORDED[-1]
+
+
+def run(fn, **kw):
+    RECORDED.clear()
+    fn(**kw)
+    return last()
+
+
+def main() -> int:
+    server.httpx.Client = _FakeClient
+    server._key_registry = {"primary": FAKE_KEY}
+    server._url_registry = {}
+    base = server.UMBRA_BASE_URL.rstrip("/")
+
+    print("\nconvert_quote_to_invoice")
+    r = run(server.convert_quote_to_invoice, quote_id="Q-UUID", idempotency_key="fixed-key")
+    check("POST /v1/quotes/{id}/convert",
+          r["method"] == "POST" and r["url"] == f"{base}/v1/quotes/Q-UUID/convert", r["url"])
+    check("empty body", r["body"] == {}, str(r["body"]))
+    check("X-Api-Key header", r["headers"].get("X-Api-Key") == FAKE_KEY)
+    check("Idempotency-Key passed through", r["headers"].get("Idempotency-Key") == "fixed-key")
+
+    r = run(server.convert_quote_to_invoice, quote_id="Q-UUID")
+    key = r["headers"].get("Idempotency-Key")
+    check("Idempotency-Key auto-generated as a UUID",
+          bool(key) and str(uuid.UUID(key)) == key, str(key))
+
+    print("\nconvert_lead_to_customer")
+    r = run(server.convert_lead_to_customer, lead_id="L-UUID", email="ap@acme.com", currency="USD")
+    check("POST /v1/leads/{id}/convert", r["url"] == f"{base}/v1/leads/L-UUID/convert")
+    check("only supplied fields sent",
+          r["body"] == {"email": "ap@acme.com", "currency": "USD"}, str(r["body"]))
+    r = run(server.convert_lead_to_customer, lead_id="L-UUID")
+    check("bare call sends {}", r["body"] == {}, str(r["body"]))
+
+    print("\ncreate_bill (DOLLARS)")
+    r = run(server.create_bill, vendor_id="V-UUID", total=230.00, subtotal=200.00,
+            tax_amount=30.00, bill_date="2026-08-29", due_date="2026-09-28",
+            vendor_bill_number="INV-9912")
+    check("POST /v1/bills", r["method"] == "POST" and r["url"] == f"{base}/v1/bills")
+    check("vendorId is the public id", r["body"]["vendorId"] == "V-UUID")
+    check("amounts stay in dollars, no cents conversion",
+          (r["body"]["total"], r["body"]["subtotal"], r["body"]["taxAmount"]) == (230.00, 200.00, 30.00),
+          str(r["body"]))
+    check("camelCase keys",
+          {"billDate", "dueDate", "vendorBillNumber", "taxAmount"} <= set(r["body"]))
+    check("billNumber omitted so the API auto-generates", "billNumber" not in r["body"])
+    r = run(server.create_bill, vendor_id="V-UUID", total=99.99)
+    check("subtotal defaults to total", r["body"]["subtotal"] == 99.99)
+    check("taxAmount defaults to 0", r["body"]["taxAmount"] == 0)
+
+    print("\nrecord_bill_payment (DOLLARS, the one dollars column)")
+    r = run(server.record_bill_payment, bill_id="B-UUID", amount=2.33,
+            payment_date="2026-08-28", payment_method="credit_card",
+            reference="MasterCard ...7305", memo="Meta ads Aug balance")
+    check("POST /v1/bills/{id}/payments", r["url"] == f"{base}/v1/bills/B-UUID/payments")
+    check("amount 2.33 sent as dollars, NOT 233",
+          r["body"]["amount"] == 2.33, str(r["body"]["amount"]))
+    check("contract body keys",
+          set(r["body"]) == {"amount", "paymentDate", "paymentMethod", "reference", "memo"},
+          str(sorted(r["body"])))
+    r = run(server.record_bill_payment, bill_id="B-UUID", amount=10.00)
+    check("optional keys omitted when not supplied", set(r["body"]) == {"amount"})
+
+    print("\ncreate_recurring_invoice")
+    r = run(server.create_recurring_invoice, customer_id="C-UUID", title="Monthly retainer",
+            frequency="monthly", start_date="2026-09-01", total=500.00,
+            day_of_month=1, payment_terms_days=14, auto_send=True)
+    check("POST /v1/recurring-invoices", r["url"] == f"{base}/v1/recurring-invoices")
+    check("contract body",
+          r["body"] == {"customerId": "C-UUID", "title": "Monthly retainer",
+                        "frequency": "monthly", "startDate": "2026-09-01",
+                        "total": 500.00, "subtotal": 500.00, "taxAmount": 0,
+                        "currency": "USD", "paymentTermsDays": 14,
+                        "autoSend": True, "dayOfMonth": 1},
+          str(r["body"]))
+
+    print("\ncreate_recurring_quote")
+    r = run(server.create_recurring_quote, customer_id="C-UUID", title="Quarterly proposal",
+            frequency="quarterly", start_date="2026-09-01", total=1500.00,
+            day_of_month=1, validity_days=30, auto_send=True)
+    check("POST /v1/recurring-quotes", r["url"] == f"{base}/v1/recurring-quotes")
+    check("sends validityDays, never paymentTermsDays",
+          r["body"].get("validityDays") == 30 and "paymentTermsDays" not in r["body"],
+          str(r["body"]))
+    check("contract body",
+          r["body"] == {"customerId": "C-UUID", "title": "Quarterly proposal",
+                        "frequency": "quarterly", "startDate": "2026-09-01",
+                        "total": 1500.00, "subtotal": 1500.00, "taxAmount": 0,
+                        "currency": "USD", "validityDays": 30,
+                        "autoSend": True, "dayOfMonth": 1},
+          str(r["body"]))
+
+    print("\nset_recurring_quote_status")
+    for action, expected in (("pause", "paused"), ("resume", "active"),
+                             ("cancel", "cancelled"), ("end", "ended")):
+        r = run(server.set_recurring_quote_status, recurring_id="R-UUID", action=action)
+        check(f"{action} -> PUT status={expected}",
+              r["method"] == "PUT" and r["url"] == f"{base}/v1/recurring-quotes/R-UUID"
+              and r["body"] == {"status": expected}, str(r["body"]))
+    RECORDED.clear()
+    out = json.loads(server.set_recurring_quote_status(recurring_id="R-UUID", action="destroy"))
+    check("unknown action rejected without any HTTP call",
+          "error" in out and not RECORDED, str(out))
+
+    print("\nupdate_recurring_invoice / update_recurring_quote / update_lead")
+    r = run(server.update_recurring_invoice, recurring_id="R-UUID",
+            updates='{"status": "paused", "total": 750.0}')
+    check("PUT /v1/recurring-invoices/{id} verbatim",
+          r["method"] == "PUT" and r["body"] == {"status": "paused", "total": 750.0})
+    r = run(server.update_recurring_quote, recurring_id="R-UUID", updates='{"validityDays": 45}')
+    check("PUT /v1/recurring-quotes/{id} verbatim", r["body"] == {"validityDays": 45})
+    r = run(server.update_lead, lead_id="L-UUID", updates='{"status": "qualified", "score": 80}')
+    check("PUT /v1/leads/{id} verbatim",
+          r["url"] == f"{base}/v1/leads/L-UUID" and r["body"] == {"status": "qualified", "score": 80})
+    RECORDED.clear()
+    out = json.loads(server.update_lead(lead_id="L-UUID", updates="{not json}"))
+    check("bad JSON rejected without any HTTP call", "error" in out and not RECORDED)
+
+    print("\nupdate_quote: items derive the header totals (the money-safety fix)")
+    r = run(server.update_quote, quote_id="Q-UUID",
+            updates=json.dumps({"notes": "Repriced",
+                                "items": [{"description": "Starter", "quantity": 1,
+                                           "unitPrice": 250.0, "total": 250.0},
+                                          {"description": "Credit", "quantity": 1,
+                                           "unitPrice": -90.0, "total": -90.0}]}))
+    put = [x for x in RECORDED if x["method"] == "PUT"][0]
+    check("subtotal derived from the lines", put["body"]["subtotal"] == 160.0, str(put["body"]))
+    check("total derived from the lines", put["body"]["total"] == 160.0, str(put["body"]))
+    check("items still sent verbatim", len(put["body"]["items"]) == 2)
+    check("re-reads the quote after writing items",
+          any(x["method"] == "GET" for x in RECORDED),
+          str([x["method"] for x in RECORDED]))
+
+    r = run(server.update_quote, quote_id="Q-UUID",
+            updates=json.dumps({"subtotal": 999.0, "total": 999.0,
+                                "items": [{"description": "X", "quantity": 1,
+                                           "unitPrice": 1.0, "total": 1.0}]}))
+    put = [x for x in RECORDED if x["method"] == "PUT"][0]
+    check("explicit totals are never overridden",
+          (put["body"]["subtotal"], put["body"]["total"]) == (999.0, 999.0), str(put["body"]))
+
+    r = run(server.update_quote, quote_id="Q-UUID",
+            updates=json.dumps({"items": [{"description": "Taxed", "quantity": 2,
+                                           "unitPrice": 100.0, "total": 200.0,
+                                           "taxRate": 15}]}))
+    put = [x for x in RECORDED if x["method"] == "PUT"][0]
+    check("per-line taxRate rolls into taxAmount and total",
+          (put["body"]["subtotal"], put["body"]["taxAmount"], put["body"]["total"]) == (200.0, 30.0, 230.0),
+          str(put["body"]))
+
+    r = run(server.update_quote, quote_id="Q-UUID", updates='{"title": "New title"}')
+    check("no items means a plain single PUT, no derivation, no re-read",
+          len(RECORDED) == 1 and RECORDED[0]["body"] == {"title": "New title"},
+          str(RECORDED))
+
+    print("\nread tools: query parameter names")
+    r = run(server.aged_receivables, as_of="2026-08-31", customer_id="C-UUID")
+    check("aged-receivables uses asOf/customerId",
+          r["url"] == f"{base}/v1/reports/aged-receivables"
+          and r["params"] == {"asOf": "2026-08-31", "customerId": "C-UUID"}, str(r["params"]))
+    r = run(server.customer_statement, customer_id="C-UUID",
+            start_date="2026-08-01", end_date="2026-08-31")
+    check("statement uses startDate/endDate",
+          r["url"] == f"{base}/v1/customers/C-UUID/statement"
+          and r["params"] == {"startDate": "2026-08-01", "endDate": "2026-08-31"}, str(r["params"]))
+    r = run(server.list_journal_entries, start_date="2026-08-01", end_date="2026-08-31",
+            status="posted", limit=10, skip=5)
+    check("journal-entries uses startDate/endDate/status/limit/skip",
+          r["params"] == {"limit": 10, "skip": 5, "startDate": "2026-08-01",
+                          "endDate": "2026-08-31", "status": "posted"}, str(r["params"]))
+    r = run(server.list_receipts, limit=10, skip=5)
+    check("receipts path and pagination",
+          r["url"] == f"{base}/v1/receipts" and r["params"] == {"limit": 10, "skip": 5})
+    r = run(server.get_receipt, receipt_id="R-UUID")
+    check("get receipt path", r["url"] == f"{base}/v1/receipts/R-UUID")
+    r = run(server.get_bill, bill_id="B-UUID")
+    check("get bill path", r["url"] == f"{base}/v1/bills/B-UUID")
+    r = run(server.get_journal_entry, entry_id="J-UUID")
+    check("get journal entry path", r["url"] == f"{base}/v1/journal-entries/J-UUID")
+    r = run(server.get_invoice_pay_link, invoice_id="I-UUID")
+    check("pay-link path", r["url"] == f"{base}/v1/invoices/I-UUID/pay-link")
+    r = run(server.list_bills, status="pending", limit=5)
+    check("bills status filter", r["params"] == {"limit": 5, "skip": 0, "status": "pending"})
+
+    print("\nno GET tool ever sends an Idempotency-Key")
+    check("reads are unkeyed",
+          all("Idempotency-Key" not in x["headers"] for x in RECORDED if x["method"] == "GET"))
+
+    print("\nper-workspace base URL")
+    server._url_registry = {"staging": "https://staging.umbraerp.com"}
+    server._key_registry = {"primary": FAKE_KEY, "staging": "usk_test_staging"}
+    r = run(server.list_receipts, workspace="staging")
+    check("staging workspace hits the staging host",
+          r["url"] == "https://staging.umbraerp.com/v1/receipts", r["url"])
+    check("staging workspace uses the staging key",
+          r["headers"]["X-Api-Key"] == "usk_test_staging")
+    r = run(server.list_receipts)
+    check("primary still hits the default host", r["url"] == f"{base}/v1/receipts")
+
+    print()
+    if FAILURES:
+        print(f"{len(FAILURES)} FAILED: " + "; ".join(FAILURES))
+        return 1
+    print("all request-shape checks passed")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
