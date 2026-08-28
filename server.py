@@ -229,6 +229,36 @@ def _ok(result: Any) -> str:
     return json.dumps(result, indent=2, default=str)
 
 
+def _write_err(e: Exception, idempotency_key: str, verify_with: str) -> str:
+    """Error shaping for writes, where a failure does NOT mean nothing happened.
+
+    Several create/convert endpoints commit the row and then raise while
+    recording the idempotency response, so the caller sees a 500 for a write
+    that landed. Blind-retrying that mints a second bill, or a second invoice
+    number off the gapless sequence. On any 5xx the caller is told to verify
+    before retrying, and handed the key it used so a deliberate retry replays
+    instead of duplicating.
+    """
+    payload = json.loads(_err(e))
+    if isinstance(e, httpx.HTTPStatusError) and e.response.status_code >= 500:
+        payload["writeMayHaveLanded"] = True
+        payload["idempotencyKeyUsed"] = idempotency_key
+        payload["action"] = (
+            f"DO NOT blindly retry. The record may already exist — check with "
+            f"{verify_with} first. If you do retry, pass this same "
+            f"idempotency_key so the call replays instead of creating a duplicate."
+        )
+    elif isinstance(e, (httpx.TimeoutException, httpx.TransportError)):
+        payload["writeMayHaveLanded"] = True
+        payload["idempotencyKeyUsed"] = idempotency_key
+        payload["action"] = (
+            f"The request did not complete cleanly, so the write may or may not "
+            f"have landed. Check with {verify_with} before retrying, and reuse "
+            f"this idempotency_key if you do."
+        )
+    return json.dumps(payload)
+
+
 def _err(e: Exception) -> str:
     if isinstance(e, httpx.HTTPStatusError):
         code = e.response.status_code
@@ -1264,11 +1294,12 @@ def convert_lead_to_customer(
         data["phone"] = phone
     if currency:
         data["currency"] = currency
+    idem = _idem(idempotency_key)
     try:
-        return _ok(_post(f"/v1/leads/{lead_id}/convert", data, workspace,
-                         _idem(idempotency_key)))
+        return _ok(_post(f"/v1/leads/{lead_id}/convert", data, workspace, idem))
     except Exception as e:
-        return _err(e)
+        return _write_err(e, idem, f"list_leads and checking whether lead {lead_id} "
+                                   "now reads status 'converted'")
 
 
 # ── ACTIVITIES (CRM) ─────────────────────────────────────────────────────────
@@ -1788,11 +1819,12 @@ def convert_quote_to_invoice(
             of re-running it. Auto-generated when omitted.
         workspace: Target business workspace (default "primary")
     """
+    idem = _idem(idempotency_key)
     try:
-        return _ok(_post(f"/v1/quotes/{quote_id}/convert", {}, workspace,
-                         _idem(idempotency_key)))
+        return _ok(_post(f"/v1/quotes/{quote_id}/convert", {}, workspace, idem))
     except Exception as e:
-        return _err(e)
+        return _write_err(e, idem, f"get_quote on {quote_id} (a converted quote reads "
+                                   "'accepted') and list_invoices for a new invoice")
 
 
 # ── RECURRING INVOICES ───────────────────────────────────────────────────────
@@ -1902,10 +1934,11 @@ def create_recurring_invoice(
         data["terms"] = terms
     if reference:
         data["reference"] = reference
+    idem = _idem(idempotency_key)
     try:
-        return _ok(_post("/v1/recurring-invoices", data, workspace, _idem(idempotency_key)))
+        return _ok(_post("/v1/recurring-invoices", data, workspace, idem))
     except Exception as e:
-        return _err(e)
+        return _write_err(e, idem, "list_recurring_invoices, matching on title")
 
 
 @mcp.tool()
@@ -2065,10 +2098,11 @@ def create_recurring_quote(
         data["terms"] = terms
     if reference:
         data["reference"] = reference
+    idem = _idem(idempotency_key)
     try:
-        return _ok(_post("/v1/recurring-quotes", data, workspace, _idem(idempotency_key)))
+        return _ok(_post("/v1/recurring-quotes", data, workspace, idem))
     except Exception as e:
-        return _err(e)
+        return _write_err(e, idem, "list_recurring_quotes, matching on title")
 
 
 @mcp.tool()
@@ -2412,10 +2446,11 @@ def create_bill(
         data["reference"] = reference
     if notes:
         data["notes"] = notes
+    idem = _idem(idempotency_key)
     try:
-        return _ok(_post("/v1/bills", data, workspace, _idem(idempotency_key)))
+        return _ok(_post("/v1/bills", data, workspace, idem))
     except Exception as e:
-        return _err(e)
+        return _write_err(e, idem, "list_bills, matching on vendorBillNumber or total")
 
 
 @mcp.tool()
@@ -2470,11 +2505,12 @@ def record_bill_payment(
         data["reference"] = reference
     if memo:
         data["memo"] = memo
+    idem = _idem(idempotency_key)
     try:
-        return _ok(_post(f"/v1/bills/{bill_id}/payments", data, workspace,
-                         _idem(idempotency_key)))
+        return _ok(_post(f"/v1/bills/{bill_id}/payments", data, workspace, idem))
     except Exception as e:
-        return _err(e)
+        return _write_err(e, idem, f"get_bill on {bill_id} and reading amountPaid / "
+                                   "balanceDue before paying again")
 
 
 # ── JOURNAL ENTRIES (read-only) ──────────────────────────────────────────────
