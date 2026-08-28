@@ -1,6 +1,6 @@
 # Umbra ERP MCP Server
 
-An [MCP (Model Context Protocol)](https://modelcontextprotocol.io) server that enables AI agents to manage ERP data through the Umbra ERP public API. Supports customers, invoices, products, quotes, payments, employees, leave requests, and webhooks.
+An [MCP (Model Context Protocol)](https://modelcontextprotocol.io) server that enables AI agents to manage ERP data through the Umbra ERP public API. Supports customers, invoices, quotes, products, payments, receipts, recurring invoice and quote schedules, supplier bills and payments, journal entries, aged receivables, customer statements, employees, leave requests, webhooks, and CRM contacts, leads and activities.
 
 ## Quick Start
 
@@ -54,7 +54,22 @@ Then restart Claude Code. The Umbra ERP tools will be available in all conversat
 python3 server.py
 ```
 
-## Available Tools (31)
+## Money units
+
+Every amount a tool takes or returns is in **dollars** (`150.00`), never cents. That includes
+`record_bill_payment`, whose `amount` is dollars end to end. Do not convert.
+
+The reports return `Cents` twins (`bucketsCents`, `totalCents`, `closingBalanceCents`) in integer
+cents. Use those for comparison and summation and the dollar fields for display; float sums drift.
+
+## Identifiers
+
+Every id you pass to a tool is a **public UUID**. A few *nested response* fields are numeric row
+ids instead and must never be fed back into a tool: `recurring*.customerId`, `bill.vendorId`,
+`customer_statement.payments[].invoiceId`, `recurring_quote.lastGeneratedQuoteId`,
+`journal.sourceId` and `journal.lines[].accountId`.
+
+## Available Tools (67)
 
 ### Customers
 | Tool | Description |
@@ -124,10 +139,67 @@ python3 server.py
 | `delete_webhook` | Delete a webhook |
 | `test_webhook` | Send a test event to a webhook |
 
+### Receipts
+| Tool | Description |
+|------|-------------|
+| `list_receipts` | List customer receipts (money in). Same rows as `list_payments` |
+| `get_receipt` | Get a single receipt by public UUID |
+
+### Pay links and quote conversion
+| Tool | Description |
+|------|-------------|
+| `get_invoice_pay_link` | Get or mint the customer-facing card pay URL for an invoice |
+| `convert_quote_to_invoice` | Convert a quote into a numbered invoice. Safe to retry |
+
+### Recurring schedules
+| Tool | Description |
+|------|-------------|
+| `list_recurring_invoices` | List recurring-invoice templates |
+| `create_recurring_invoice` | Create a schedule that bills a customer automatically |
+| `update_recurring_invoice` | Update a schedule (including pause/cancel via `status`) |
+| `list_recurring_quotes` | List recurring-quote templates |
+| `create_recurring_quote` | Create a schedule that emits quotes automatically |
+| `update_recurring_quote` | Update a schedule, including `validityDays` |
+| `set_recurring_quote_status` | Pause, resume, cancel or end a quote schedule |
+| `recurring_quote_history` | Generation counters for one quote schedule |
+
+### Reports
+| Tool | Description |
+|------|-------------|
+| `aged_receivables` | Outstanding receivables bucketed by days PAST DUE |
+| `customer_statement` | Invoices, receipts and closing balance for one customer |
+
+### Bills (accounts payable)
+| Tool | Description |
+|------|-------------|
+| `list_bills` | List supplier bills with a status filter |
+| `get_bill` | Get a single bill by public UUID |
+| `create_bill` | Record a supplier bill (a payable) |
+| `record_bill_payment` | Pay a bill. Amount in DOLLARS. Overpayment is rejected, not clamped |
+
+### Journal entries (read-only)
+| Tool | Description |
+|------|-------------|
+| `list_journal_entries` | List ledger entries with date and status filters |
+| `get_journal_entry` | Get one entry with its debit/credit lines |
+
+There is deliberately no journal write tool. Entries are posted from real events; a hand-made entry
+would be a figure in the ledger with no document behind it.
+
+### CRM
+| Tool | Description |
+|------|-------------|
+| `list_contacts`, `get_contact`, `create_contact` | CRM contacts |
+| `list_leads`, `create_lead` | CRM leads |
+| `update_lead` | Update lead fields (status is enum-validated) |
+| `convert_lead_to_customer` | Convert a lead into a customer. Safe to retry |
+| `list_activities`, `create_activity` | CRM activities |
+
 ### System
 | Tool | Description |
 |------|-------------|
-| `check_status` | Verify API connectivity and auth |
+| `list_workspaces` | List configured business workspaces (names only) |
+| `check_status` | Verify API connectivity, auth and the resources reachable |
 
 ## Authentication
 
@@ -138,7 +210,28 @@ All requests use the `X-Api-Key` header. API keys come in two types:
 | **Secret** | `usk_live_*` / `usk_test_*` | Full access including salary, bank details, national ID |
 | **Publishable** | `uk_live_*` / `uk_test_*` | Standard access, sensitive employee fields excluded |
 
-Keys are scoped by **permissions** (customers, invoices, products, quotes, payments, employees, webhooks). Your key only accesses the resources it has permission for.
+Keys are scoped by **permissions**. Your key only reaches the resources it holds a scope for:
+
+| Tools | Required permission |
+|---|---|
+| customers, `customer_statement` | `customers` |
+| invoices, `get_invoice_pay_link`, recurring invoices | `invoices` |
+| quotes, `convert_quote_to_invoice`, recurring quotes | `quotes` |
+| products | `products` |
+| payments, receipts | `payments` |
+| leads, `update_lead`, `convert_lead_to_customer` | `leads` |
+| contacts | `contacts` |
+| activities | `activities` |
+| employees, leave requests | `employees` |
+| pay runs, payslips | `payroll` |
+| bills, `record_bill_payment` | `bills` |
+| journal entries | `journal` |
+| `aged_receivables` | `reports` |
+| webhooks | `webhooks` |
+
+**`bills`, `journal`, `reports`, `employees` and `payroll` only became grantable on 2026-08-29.**
+A key minted before that date cannot hold them and returns 403 on those endpoints. Re-mint the key
+with the scopes you need.
 
 ## Rate Limits
 
@@ -166,8 +259,22 @@ Payloads are signed with HMAC-SHA256 via the `X-Webhook-Signature` header.
 
 | Environment Variable | Default | Description |
 |---------------------|---------|-------------|
-| `UMBRA_API_KEY` | — | Your Umbra ERP API key (required) |
-| `UMBRA_API_URL` | `https://umbra-erp-api-europenorth1-wufqavak5a-lz.a.run.app` | API base URL |
+| `UMBRA_API_KEY` | none | Your Umbra ERP API key (required). Becomes the `primary` workspace |
+| `UMBRA_API_KEY_<NAME>` | none | Extra business workspaces, e.g. `UMBRA_API_KEY_MWANA` |
+| `UMBRA_API_URL` | `https://umbra-erp-api-europenorth1-wufqavak5a-lz.a.run.app` | Default API base URL |
+| `UMBRA_API_URL_<NAME>` | `UMBRA_API_URL` | Base URL for one workspace. A key is bound to one business AND one environment, so a workspace holding a staging key needs its host set here or it will 401 against production |
+
+Every tool takes an optional `workspace` argument (default `primary`).
+
+## Tests
+
+```bash
+../.venv/bin/python test_request_shapes.py
+```
+
+Offline request-shape checks: they replace `httpx.Client` with a recorder and assert the exact
+method, path, headers and JSON body every write tool sends. No network, no API key, no database,
+so a mutation tool can be verified without pointing it at a live business.
 
 ## API Documentation
 
