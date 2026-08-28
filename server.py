@@ -253,6 +253,41 @@ def _csv_list(value: str | None) -> list[str]:
     return [v.strip() for v in value.split(",") if v.strip()] if value else []
 
 
+def _line_total(item: dict) -> float:
+    """Net dollar total of one document line.
+
+    Prefers the caller's explicit `total`; falls back to quantity x unitPrice
+    less discountPercent so a caller who omits it still gets a coherent header.
+    """
+    if item.get("total") is not None:
+        return float(item["total"])
+    gross = float(item.get("quantity", 1) or 0) * float(item.get("unitPrice", 0) or 0)
+    return gross * (1 - float(item.get("discountPercent", 0) or 0) / 100.0)
+
+
+def _derive_document_totals(items: list[dict], payload: dict) -> dict[str, float]:
+    """Derive {subtotal, taxAmount, total} in DOLLARS from a line-item array.
+
+    Used only to backfill keys the caller did not send. The API patches the
+    header figures and the lines independently: sending `items` alone replaces
+    the lines but leaves `subtotal`/`total` at their old values, which is how a
+    quote ends up with lines that add to $250 under a total that still reads
+    $575. Deriving them keeps the document internally consistent.
+    """
+    subtotal = round(sum(_line_total(i) for i in items), 2)
+    if payload.get("taxAmount") is not None:
+        tax = float(payload["taxAmount"])
+    else:
+        tax = round(sum(_line_total(i) * float(i.get("taxRate", 0) or 0) / 100.0
+                        for i in items), 2)
+    discount = float(payload.get("discountAmount") or 0)
+    return {
+        "subtotal": subtotal,
+        "taxAmount": tax,
+        "total": round(subtotal - discount + tax, 2),
+    }
+
+
 # ============================================================================
 # MCP Server
 # ============================================================================
@@ -776,6 +811,19 @@ def update_quote(quote_id: str, updates: str, workspace: str = "primary") -> str
     Editing lines in place replaces the old delete-and-recreate workaround,
     which burned the quote number and its history.
 
+    MONEY SAFETY. The API patches the header figures and the lines
+    independently, so `items` on its own moves the lines and leaves `subtotal`
+    / `total` at their old values — a quote whose lines add to $250 under a
+    total that still reads $575. When you send `items` without `subtotal` /
+    `total`, this tool derives them from the lines (sum of line totals, plus
+    per-line `taxRate`, less any `discountAmount` you sent) so the document
+    cannot contradict itself. Send them explicitly to override the derivation.
+
+    Whenever `items` is sent the quote is re-read after the write and the tool
+    returns the SERVER's post-write state under `quote`, with `itemsSent`,
+    `itemsStored` and `itemsRoundTripped` so a silently dropped line array is
+    visible instead of reading as a bare 200.
+
     Args:
         quote_id: The quote's public UUID
         updates: JSON string with fields to update
@@ -783,9 +831,39 @@ def update_quote(quote_id: str, updates: str, workspace: str = "primary") -> str
     """
     try:
         data = json.loads(updates)
-        return _ok(_put(f"/v1/quotes/{quote_id}", data, workspace))
     except json.JSONDecodeError:
         return json.dumps({"error": "Invalid JSON in updates parameter"})
+
+    items = data.get("items") if "items" in data else None
+    if items is not None:
+        if not isinstance(items, list) or not all(isinstance(i, dict) for i in items):
+            return json.dumps({"error": "'items' must be an array of objects"})
+        derived = _derive_document_totals(items, data)
+        for field in ("subtotal", "taxAmount", "total"):
+            if field not in data:
+                data[field] = derived[field]
+
+    try:
+        result = _put(f"/v1/quotes/{quote_id}", data, workspace)
+        if items is None:
+            return _ok(result)
+        # Re-read: the write is not done until the server says the lines moved.
+        fresh = _get(f"/v1/quotes/{quote_id}", workspace=workspace).get("data") or {}
+        stored = fresh.get("items") or []
+        out: dict[str, Any] = {
+            "quote": fresh,
+            "itemsSent": len(items),
+            "itemsStored": len(stored),
+            "itemsRoundTripped": len(stored) == len(items),
+            "derivedTotals": {k: v for k, v in data.items()
+                              if k in ("subtotal", "taxAmount", "total")},
+        }
+        if not out["itemsRoundTripped"]:
+            out["warning"] = (
+                f"Sent {len(items)} line(s) but the quote now stores {len(stored)}. "
+                "The line items did NOT land — do not send this quote to a customer."
+            )
+        return _ok(out)
     except Exception as e:
         return _err(e)
 
