@@ -295,12 +295,22 @@ def _derive_document_totals(items: list[dict], payload: dict) -> dict[str, float
 mcp = FastMCP(
     "Umbra ERP",
     instructions=(
-        "Manage ERP + CRM data (customers, invoices, products, quotes, payments, employees, "
-        "leave requests, webhooks, and CRM contacts, leads, activities) via the Umbra ERP "
-        "public API. Used by Mufasa for business operations. Multi-workspace: every tool takes "
-        "an optional `workspace` argument (default 'primary') to target a specific business; "
-        "extra workspaces are configured via UMBRA_API_KEY_<NAME> env vars. Use list_workspaces "
-        "or check_status to see which workspaces are configured."
+        "Manage ERP + CRM + finance data (customers, invoices, quotes, products, payments, "
+        "receipts, recurring invoice/quote schedules, bills and supplier payments, journal "
+        "entries, aged receivables, customer statements, employees, leave requests, webhooks, "
+        "and CRM contacts, leads, activities) via the Umbra ERP public API. Used by Mufasa for "
+        "business operations. "
+        "MONEY UNITS: every amount in and out of these tools is DOLLARS (150.00), never cents, "
+        "including bill payments. Fields whose name ends in `Cents` are the only exception and "
+        "are integer cents — prefer those for arithmetic and the dollar fields for display. "
+        "IDS: every id you pass in a tool argument is a public UUID. A few NESTED response "
+        "fields are numeric row ids instead (recurring*.customerId, bill.vendorId, "
+        "statement.payments[].invoiceId, journal sourceId and lines[].accountId); never feed "
+        "those back into a tool. "
+        "Multi-workspace: every tool takes an optional `workspace` argument (default 'primary') "
+        "to target a specific business; extra workspaces are configured via UMBRA_API_KEY_<NAME> "
+        "env vars, with an optional UMBRA_API_URL_<NAME> when that workspace lives on another "
+        "host. Use list_workspaces or check_status to see which workspaces are configured."
     ),
 )
 
@@ -2581,9 +2591,18 @@ def check_status(workspace: str = "primary") -> str:
             "customers_accessible": "pagination" in result,
             "resources": [
                 "customers", "invoices", "products", "quotes", "payments",
+                "receipts", "recurring_invoices", "recurring_quotes",
                 "contacts", "leads", "activities",
                 "employees", "leave_requests", "webhooks",
+                "bills", "journal_entries", "reports",
             ],
+            "permissions_note": (
+                "Each resource needs its scope on the API key. bills -> `bills`, "
+                "journal_entries -> `journal`, aged_receivables -> `reports`, "
+                "receipts -> `payments`. Those three plus `employees` and `payroll` "
+                "only became grantable on 2026-08-29, so a key minted before that "
+                "date 403s on them and must be re-minted."
+            ),
         }, indent=2)
     except Exception as e:
         return json.dumps({
