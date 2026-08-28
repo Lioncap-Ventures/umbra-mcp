@@ -649,6 +649,12 @@ def create_quote(
         subtotal: Subtotal in dollars
         total: Total in dollars
         items: JSON string array of line items, e.g. '[{"description":"Widget","quantity":5,"unitPrice":200.00,"total":1000.00}]'
+            Each item takes: description, quantity, unitPrice, total, and
+            optionally productId, discountPercent, taxRate, sortOrder.
+            productId is a product's public UUID (from list_products/get_product),
+            which the API resolves to the catalogue product; an unknown or
+            omitted productId leaves the line as free text rather than failing.
+            Prices are in dollars.
         notes: Optional notes
         workspace: Target business workspace (default "primary")
     """
@@ -677,6 +683,25 @@ def create_quote(
 @mcp.tool()
 def update_quote(quote_id: str, updates: str, workspace: str = "primary") -> str:
     """Update a quote. Pass a JSON string of fields to update.
+
+    Scalar fields are safe partial updates: send only the keys you want
+    changed (title, notes, status, reference, terms, footer, currency,
+    customerId, quoteNumber, quoteDate, expiryDate, subtotal, discountAmount,
+    discountPercent, taxAmount, total, customFields) and the rest are left
+    alone.
+
+    `items` is the exception: it is a FULL REPLACEMENT, not a merge. Sending
+    it swaps the quote's line items for exactly the array given, so include
+    every line you want to keep, not just the one you are changing. Omit the
+    key to leave the existing lines untouched; send [] to clear them. Each
+    item takes {productId?, description, quantity, unitPrice, total} and
+    optionally discountPercent, taxRate, sortOrder: the same shape
+    create_quote accepts, with productId as a product's public UUID and
+    prices in dollars. A malformed items array rejects the whole update, so
+    the scalar fields cannot land without the lines.
+
+    Editing lines in place replaces the old delete-and-recreate workaround,
+    which burned the quote number and its history.
 
     Args:
         quote_id: The quote's public UUID
