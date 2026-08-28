@@ -244,7 +244,7 @@ def _write_err(e: Exception, idempotency_key: str, verify_with: str) -> str:
         payload["writeMayHaveLanded"] = True
         payload["idempotencyKeyUsed"] = idempotency_key
         payload["action"] = (
-            f"DO NOT blindly retry. The record may already exist — check with "
+            f"DO NOT blindly retry. The record may already exist; check with "
             f"{verify_with} first. If you do retry, pass this same "
             f"idempotency_key so the call replays instead of creating a duplicate."
         )
@@ -267,7 +267,7 @@ def _err(e: Exception) -> str:
         if code == 403 and "permission" in detail:
             out["hint"] = (
                 "The API key is missing this scope. bills, journal, reports, employees "
-                "and payroll only became grantable on 2026-08-29 — a key minted before "
+                "and payroll only became grantable on 2026-08-29; a key minted before "
                 "then cannot hold them and must be re-minted with the scope."
             )
         elif code == 404:
@@ -332,7 +332,7 @@ mcp = FastMCP(
         "business operations. "
         "MONEY UNITS: every amount in and out of these tools is DOLLARS (150.00), never cents, "
         "including bill payments. Fields whose name ends in `Cents` are the only exception and "
-        "are integer cents — prefer those for arithmetic and the dollar fields for display. "
+        "are integer cents; prefer those for arithmetic and the dollar fields for display. "
         "IDS: every id you pass in a tool argument is a public UUID. A few NESTED response "
         "fields are numeric row ids instead (recurring*.customerId, bill.vendorId, "
         "statement.payments[].invoiceId, journal sourceId and lines[].accountId); never feed "
@@ -853,7 +853,7 @@ def update_quote(quote_id: str, updates: str, workspace: str = "primary") -> str
 
     MONEY SAFETY. The API patches the header figures and the lines
     independently, so `items` on its own moves the lines and leaves `subtotal`
-    / `total` at their old values — a quote whose lines add to $250 under a
+    / `total` at their old values; a quote whose lines add to $250 under a
     total that still reads $575. When you send `items` without `subtotal` /
     `total`, this tool derives them from the lines (sum of line totals, plus
     per-line `taxRate`, less any `discountAmount` you sent) so the document
@@ -901,7 +901,7 @@ def update_quote(quote_id: str, updates: str, workspace: str = "primary") -> str
         if not out["itemsRoundTripped"]:
             out["warning"] = (
                 f"Sent {len(items)} line(s) but the quote now stores {len(stored)}. "
-                "The line items did NOT land — do not send this quote to a customer."
+                "The line items did NOT land; do not send this quote to a customer."
             )
         return _ok(out)
     except Exception as e:
@@ -1226,7 +1226,7 @@ def update_lead(lead_id: str, updates: str, workspace: str = "primary") -> str:
 
     `status` is validated against the LeadStatus enum and a bad value returns
     400 listing the valid ones. Setting status to "converted" by hand does NOT
-    create a customer — use convert_lead_to_customer for that, or the lead is
+    create a customer; use convert_lead_to_customer for that, or the lead is
     marked converted with nothing on the other side.
 
     Args:
@@ -1753,16 +1753,16 @@ def get_invoice_pay_link(invoice_id: str, workspace: str = "primary") -> str:
     live one afterwards so a link already given to a customer stays valid, and
     regenerates a lapsed one. Token TTL is 30 days.
 
-    NEVER construct a pay URL yourself — the token and its eligibility gates
+    NEVER construct a pay URL yourself; the token and its eligibility gates
     are server-owned. Read `payUrl` here or off the invoice object.
 
     Availability is not an error. When the rail is unavailable this returns
     HTTP 200 with `available: false`, `payUrl: null` and a `reason` you should
     report verbatim, one of:
-      - "Card payments are not enabled for this business" — the tenant is not
+      - "Card payments are not enabled for this business" -> the tenant is not
         opted in. The tenant CANNOT self-enable; a Lioncap admin must do it,
         because the money lands in the Lioncap merchant account.
-      - "Pay links are USD only; this invoice is ZWG" — currency gate.
+      - "Pay links are USD only; this invoice is ZWG" -> currency gate.
 
     When available: {invoiceId, invoiceNumber, payUrl, available: true,
     amountDue (DOLLARS), currency, expiresAt (ISO-8601 UTC with Z)}.
@@ -1956,7 +1956,7 @@ def update_recurring_invoice(recurring_id: str, updates: str, workspace: str = "
     history, "active" to resume, "cancelled" to stop it for good.
 
     NOTE: sending an explicit null for endDate / nextInvoiceDate / frequency /
-    dayOfMonth does NOT clear the stored value — the API skips null on those
+    dayOfMonth does NOT clear the stored value; the API skips null on those
     fields. There is no way to un-set them through this endpoint.
 
     Args:
@@ -2002,7 +2002,7 @@ def list_recurring_quotes(
 
     `validityDays` is canonical: how long each generated quote stays open.
     `paymentTermsDays` is accepted on write as an alias but is NEVER returned
-    on a recurring quote — do not read it off this shape.
+    on a recurring quote; do not read it off this shape.
 
     Generating a quote books nothing. A quote is an offer, not a receivable;
     money only moves when it is converted to an invoice and paid.
@@ -2052,7 +2052,7 @@ def create_recurring_quote(
     `start_date` itself. Requires the `quotes` permission.
 
     All money arguments are in DOLLARS. Generating a quote posts nothing to the
-    ledger — a quote is an offer, not a receivable.
+    ledger; a quote is an offer, not a receivable.
 
     Args:
         customer_id: Customer public UUID
@@ -2124,7 +2124,7 @@ def update_recurring_quote(recurring_id: str, updates: str, workspace: str = "pr
     matches no filter.
 
     NOTE: an explicit null for endDate / nextQuoteDate / frequency /
-    dayOfMonth does NOT clear the stored value — the API skips null on those.
+    dayOfMonth does NOT clear the stored value; the API skips null on those.
 
     Args:
         recurring_id: The template's public UUID
@@ -2160,7 +2160,7 @@ def set_recurring_quote_status(
     be stored silently and leave the schedule matching no status filter. This
     tool rejects anything outside the four actions rather than writing it.
 
-    Recurring INVOICE templates have no equivalent action tool — use
+    Recurring INVOICE templates have no equivalent action tool; use
     update_recurring_invoice with '{"status": "paused"}' (their status set is
     active, paused, completed, cancelled).
 
@@ -2196,7 +2196,7 @@ def recurring_quote_history(recurring_id: str, workspace: str = "primary") -> st
     lastGeneratedQuoteId, nextQuoteDate, status, frequency, validityDays and
     total (DOLLARS).
 
-    `lastGeneratedQuoteId` is a NUMERIC row id, NOT a public UUID — get_quote
+    `lastGeneratedQuoteId` is a NUMERIC row id, NOT a public UUID; get_quote
     will not accept it. To see the actual documents, call list_quotes and match
     on customer and date.
 
@@ -2263,7 +2263,7 @@ def aged_receivables(
     61-90, days90Plus = 91+.
 
     Excludes draft (never issued), cancelled (reversed), paid, and bad_debt
-    (already written off) — none of them is money anyone expects to collect.
+    (already written off); none of them is money anyone expects to collect.
 
     Returns buckets and byCustomer rows in DOLLARS, plus `bucketsCents` and
     `totalCents` in integer CENTS. USE THE CENTS FIELDS for any comparison or
@@ -2302,7 +2302,7 @@ def customer_statement(
     openingBalance + totalInvoiced - totalPaid = closingBalance always holds.
     Without `start_date` the opening balance is 0.00 and the statement covers
     all history. `closingBalance` can be NEGATIVE when the customer is in
-    credit — do not clamp it to zero. Draft and cancelled invoices are excluded.
+    credit; do not clamp it to zero. Draft and cancelled invoices are excluded.
 
     Money fields are DOLLARS, with `closingBalanceCents` in integer CENTS for
     exact arithmetic. Dates are YYYY-MM-DD.
@@ -2411,7 +2411,7 @@ def create_bill(
 
     Args:
         vendor_id: The vendor's PUBLIC UUID (required; 400 without it). Note the
-            response returns a numeric vendorId — do not feed that back here.
+            response returns a numeric vendorId; do not feed that back here.
         total: Bill total in DOLLARS. Must be greater than zero.
         bill_date: Bill date (YYYY-MM-DD, default today)
         due_date: Payment due date (YYYY-MM-DD)
@@ -2470,7 +2470,7 @@ def record_bill_payment(
     balanceDue / status, and posts the DR Accounts Payable / CR Cash journal
     entry. Requires the `bills` permission.
 
-    `amount` is in DOLLARS end to end — send 2.33 for two dollars thirty-three.
+    `amount` is in DOLLARS end to end; send 2.33 for two dollars thirty-three.
     Do NOT convert to cents: this is the one money column in the schema stored
     in dollars, and the API normalises it for you either way, so a
     cents-converted figure would pay the supplier 100x.
@@ -2478,7 +2478,7 @@ def record_bill_payment(
     OVERPAYMENT IS REJECTED WITH 400, not clamped:
     "Payment of 250.0 exceeds the outstanding balance of 233.0". Read
     `balanceDue` with get_bill first. (Customer receipts behave the opposite
-    way — an overpayment there is recorded and flagged, because that cash has
+    way; an overpayment there is recorded and flagged, because that cash has
     already arrived. Supplier money has not left yet and an excess is almost
     always a typo.)
 
@@ -2542,7 +2542,7 @@ def list_journal_entries(
     approved, posted, rejected, reversed.
 
     WARNING: `sourceId` is a NUMERIC row id of the source document, not a
-    public UUID — it cannot be passed to get_invoice or get_bill.
+    public UUID; it cannot be passed to get_invoice or get_bill.
 
     There is no write path by design. Do not look for one.
 
