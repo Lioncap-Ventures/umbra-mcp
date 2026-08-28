@@ -17,6 +17,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import uuid
 from typing import Any
 
 import httpx
@@ -35,14 +36,18 @@ UMBRA_BASE_URL = os.environ.get(
 )
 
 _ENV_PREFIX = "UMBRA_API_KEY"
+_URL_PREFIX = "UMBRA_API_URL_"
 _PRIMARY = "primary"
 
 # {workspace_name -> api_key}, built lazily at first use.
 _key_registry: dict[str, str] | None = None
+# {workspace_name -> base_url} for workspaces that live on a different host
+# (e.g. a staging business). Built lazily alongside the key registry.
+_url_registry: dict[str, str] | None = None
 
 
-def _read_env_file_keys() -> dict[str, str]:
-    """Read UMBRA_API_KEY* entries from ~/.claude/scripts/.env (Claude Code fallback).
+def _read_env_file(prefix: str) -> dict[str, str]:
+    """Read env-var entries starting with `prefix` from ~/.claude/scripts/.env.
 
     Returns a dict keyed by the raw env-var name (e.g. UMBRA_API_KEY,
     UMBRA_API_KEY_MWANA). Missing file is not an error.
@@ -57,11 +62,16 @@ def _read_env_file_keys() -> dict[str, str]:
                     continue
                 name, val = line.split("=", 1)
                 name, val = name.strip(), val.strip()
-                if name.startswith(_ENV_PREFIX) and name != "UMBRA_API_URL" and val:
+                if name.startswith(prefix) and name != "UMBRA_API_URL" and val:
                     found[name] = val
     except FileNotFoundError:
         pass
     return found
+
+
+def _read_env_file_keys() -> dict[str, str]:
+    """Read UMBRA_API_KEY* entries from ~/.claude/scripts/.env (Claude Code fallback)."""
+    return _read_env_file(_ENV_PREFIX)
 
 
 def _build_registry() -> dict[str, str]:
@@ -121,16 +131,53 @@ def _get_api_key(workspace: str = _PRIMARY) -> str:
     return _resolve_key(workspace)
 
 
+def _build_url_registry() -> dict[str, str]:
+    """Build {workspace -> base_url} from UMBRA_API_URL_<NAME> env vars.
+
+    A key is bound to one business AND one environment, so a workspace holding
+    a staging key must be sent to the staging host or it will 401 against
+    production. UMBRA_API_URL stays the default for every workspace that has no
+    override. Process env beats ~/.claude/scripts/.env. Cached after first build.
+    """
+    global _url_registry
+    if _url_registry is not None:
+        return _url_registry
+
+    raw: dict[str, str] = {}
+    raw.update(_read_env_file(_URL_PREFIX))
+    for name, val in os.environ.items():
+        if name.startswith(_URL_PREFIX) and val:
+            raw[name] = val
+
+    registry: dict[str, str] = {}
+    for name, val in raw.items():
+        workspace = name[len(_URL_PREFIX):].strip().lower()
+        if workspace and val:
+            registry[workspace] = val.rstrip("/")
+
+    _url_registry = registry
+    return registry
+
+
+def _base_url(workspace: str = _PRIMARY) -> str:
+    """Resolve the API base URL for a workspace (UMBRA_BASE_URL unless overridden)."""
+    ws = (workspace or _PRIMARY).strip().lower()
+    return _build_url_registry().get(ws, UMBRA_BASE_URL.rstrip("/"))
+
+
 # ============================================================================
 # HTTP helpers
 # ============================================================================
 
-def _headers(workspace: str = _PRIMARY) -> dict[str, str]:
-    return {"X-Api-Key": _resolve_key(workspace), "Content-Type": "application/json"}
+def _headers(workspace: str = _PRIMARY, idempotency_key: str | None = None) -> dict[str, str]:
+    headers = {"X-Api-Key": _resolve_key(workspace), "Content-Type": "application/json"}
+    if idempotency_key:
+        headers["Idempotency-Key"] = idempotency_key
+    return headers
 
 
 def _get(path: str, params: dict | None = None, workspace: str = _PRIMARY) -> Any:
-    url = f"{UMBRA_BASE_URL}{path}"
+    url = f"{_base_url(workspace)}{path}"
     log.info("GET %s [ws=%s]", url, workspace)
     with httpx.Client(timeout=30) as client:
         resp = client.get(url, headers=_headers(workspace), params=params or {})
@@ -138,17 +185,18 @@ def _get(path: str, params: dict | None = None, workspace: str = _PRIMARY) -> An
         return resp.json()
 
 
-def _post(path: str, data: dict, workspace: str = _PRIMARY) -> Any:
-    url = f"{UMBRA_BASE_URL}{path}"
+def _post(path: str, data: dict, workspace: str = _PRIMARY,
+          idempotency_key: str | None = None) -> Any:
+    url = f"{_base_url(workspace)}{path}"
     log.info("POST %s [ws=%s]", url, workspace)
     with httpx.Client(timeout=30) as client:
-        resp = client.post(url, headers=_headers(workspace), json=data)
+        resp = client.post(url, headers=_headers(workspace, idempotency_key), json=data)
         resp.raise_for_status()
         return resp.json()
 
 
 def _put(path: str, data: dict, workspace: str = _PRIMARY) -> Any:
-    url = f"{UMBRA_BASE_URL}{path}"
+    url = f"{_base_url(workspace)}{path}"
     log.info("PUT %s [ws=%s]", url, workspace)
     with httpx.Client(timeout=30) as client:
         resp = client.put(url, headers=_headers(workspace), json=data)
@@ -157,12 +205,24 @@ def _put(path: str, data: dict, workspace: str = _PRIMARY) -> Any:
 
 
 def _delete(path: str, workspace: str = _PRIMARY) -> Any:
-    url = f"{UMBRA_BASE_URL}{path}"
+    url = f"{_base_url(workspace)}{path}"
     log.info("DELETE %s [ws=%s]", url, workspace)
     with httpx.Client(timeout=30) as client:
         resp = client.delete(url, headers=_headers(workspace))
         resp.raise_for_status()
         return resp.json()
+
+
+def _idem(idempotency_key: str | None) -> str:
+    """Return the caller's Idempotency-Key, or mint one.
+
+    Every write goes out with a key. An agent retries on timeout without a
+    human deciding to, and an unkeyed retry of "create bill" or "pay bill" is a
+    duplicated supplier payment. Pass the SAME key to make a deliberate retry
+    replay the original response instead of executing twice; replaying a key
+    with a different body is rejected (422) rather than silently swallowed.
+    """
+    return (idempotency_key or "").strip() or str(uuid.uuid4())
 
 
 def _ok(result: Any) -> str:
@@ -171,7 +231,20 @@ def _ok(result: Any) -> str:
 
 def _err(e: Exception) -> str:
     if isinstance(e, httpx.HTTPStatusError):
-        return json.dumps({"error": f"HTTP {e.response.status_code}", "detail": e.response.text[:500]})
+        code = e.response.status_code
+        detail = e.response.text[:500]
+        out: dict[str, Any] = {"error": f"HTTP {code}", "detail": detail}
+        if code == 403 and "permission" in detail:
+            out["hint"] = (
+                "The API key is missing this scope. bills, journal, reports, employees "
+                "and payroll only became grantable on 2026-08-29 — a key minted before "
+                "then cannot hold them and must be re-minted with the scope."
+            )
+        elif code == 404:
+            # The API cannot distinguish "no such row" from "another business's
+            # row", and saying which would leak cross-tenant existence.
+            out["hint"] = "Not found. Check the public id (UUID) and the workspace."
+        return json.dumps(out)
     return json.dumps({"error": str(e)})
 
 
