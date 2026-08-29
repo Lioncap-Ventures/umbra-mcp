@@ -332,9 +332,117 @@ def main() -> int:
     r = run(server.list_bills, status="pending", limit=5)
     check("bills status filter", r["params"] == {"limit": 5, "skip": 0, "status": "pending"})
 
+    print("\nevery mutation tool sends an Idempotency-Key")
+    items_json = '[{"description": "X", "quantity": 1, "unitPrice": 1.0, "total": 1.0}]'
+    mutations = [
+        (server.create_customer, {"company_name": "Acme"}),
+        (server.update_customer, {"customer_id": "C", "updates": '{"phone": "+263"}'}),
+        (server.delete_customer, {"customer_id": "C"}),
+        (server.create_invoice, {"customer_id": "C", "invoice_date": "2026-08-29",
+                                 "due_date": "2026-09-28", "currency": "USD",
+                                 "subtotal": 1.0, "total": 1.0, "balance_due": 1.0,
+                                 "items": items_json}),
+        (server.update_invoice, {"invoice_id": "I", "updates": '{"status": "sent"}'}),
+        (server.delete_invoice, {"invoice_id": "I"}),
+        (server.create_product, {"name": "Widget", "price": 1.0}),
+        (server.update_product, {"product_id": "P", "updates": '{"price": 2.0}'}),
+        (server.delete_product, {"product_id": "P"}),
+        (server.create_quote, {"customer_id": "C", "title": "T", "quote_date": "2026-08-29",
+                               "expiry_date": "2026-09-28", "subtotal": 1.0,
+                               "total": 1.0, "items": items_json}),
+        (server.update_quote, {"quote_id": "Q", "updates": '{"title": "T2"}'}),
+        (server.delete_quote, {"quote_id": "Q"}),
+        (server.create_payment, {"customer_id": "C", "amount": 1.0}),
+        (server.create_contact, {"first_name": "Ada"}),
+        (server.create_lead, {"first_name": "Ada"}),
+        (server.update_lead, {"lead_id": "L", "updates": '{"score": 1}'}),
+        (server.convert_lead_to_customer, {"lead_id": "L"}),
+        (server.create_activity, {"activity_type": "call", "subject": "S"}),
+        (server.create_employee, {"first_name": "Ada", "last_name": "L"}),
+        (server.update_employee, {"employee_id": "E", "updates": '{"jobTitle": "CTO"}'}),
+        (server.delete_employee, {"employee_id": "E"}),
+        (server.create_leave_request, {"employee_id": "E", "leave_type": "annual",
+                                       "start_date": "2026-09-01", "end_date": "2026-09-02",
+                                       "days_requested": 2}),
+        (server.update_leave_request, {"leave_id": "LV", "updates": '{"status": "approved"}'}),
+        (server.delete_leave_request, {"leave_id": "LV"}),
+        (server.create_webhook, {"name": "W", "url": "https://x.test", "events": "quote.created"}),
+        (server.delete_webhook, {"webhook_id": "W"}),
+        (server.test_webhook, {"webhook_id": "W"}),
+        (server.convert_quote_to_invoice, {"quote_id": "Q"}),
+        (server.create_bill, {"vendor_id": "V", "total": 1.0}),
+        (server.record_bill_payment, {"bill_id": "B", "amount": 1.0}),
+        (server.create_recurring_invoice, {"customer_id": "C", "title": "T",
+                                           "frequency": "monthly",
+                                           "start_date": "2026-09-01", "total": 1.0}),
+        (server.update_recurring_invoice, {"recurring_id": "R", "updates": '{"status": "paused"}'}),
+        (server.create_recurring_quote, {"customer_id": "C", "title": "T",
+                                         "frequency": "monthly",
+                                         "start_date": "2026-09-01", "total": 1.0}),
+        (server.update_recurring_quote, {"recurring_id": "R", "updates": '{"validityDays": 45}'}),
+        (server.set_recurring_quote_status, {"recurring_id": "R", "action": "pause"}),
+    ]
+    unkeyed, bad_uuid = [], []
+    for fn, kwargs in mutations:
+        RECORDED.clear()
+        fn(**kwargs)
+        writes = [x for x in RECORDED if x["method"] in ("POST", "PUT", "DELETE")]
+        if not writes:
+            unkeyed.append(f"{fn.__name__} (no write recorded)")
+            continue
+        for w in writes:
+            key = w["headers"].get("Idempotency-Key")
+            if not key:
+                unkeyed.append(f"{fn.__name__} {w['method']}")
+                continue
+            try:
+                if str(uuid.UUID(key)) != key:
+                    raise ValueError
+            except (ValueError, AttributeError, TypeError):
+                bad_uuid.append(f"{fn.__name__}={key}")
+    check(f"all {len(mutations)} mutation tools send the header",
+          not unkeyed, "missing on: " + ", ".join(unkeyed))
+    check("auto-generated keys are UUIDs", not bad_uuid, ", ".join(bad_uuid))
+
+    explicit = [
+        (server.create_customer, {"company_name": "Acme"}),
+        (server.create_product, {"name": "W", "price": 1.0}),
+        (server.create_quote, {"customer_id": "C", "title": "T", "quote_date": "2026-08-29",
+                               "expiry_date": "2026-09-28", "subtotal": 1.0,
+                               "total": 1.0, "items": items_json}),
+        (server.create_invoice, {"customer_id": "C", "invoice_date": "2026-08-29",
+                                 "due_date": "2026-09-28", "currency": "USD",
+                                 "subtotal": 1.0, "total": 1.0, "balance_due": 1.0,
+                                 "items": items_json}),
+        (server.create_payment, {"customer_id": "C", "amount": 1.0}),
+        (server.create_bill, {"vendor_id": "V", "total": 1.0}),
+        (server.record_bill_payment, {"bill_id": "B", "amount": 1.0}),
+        (server.create_recurring_invoice, {"customer_id": "C", "title": "T",
+                                           "frequency": "monthly",
+                                           "start_date": "2026-09-01", "total": 1.0}),
+        (server.create_recurring_quote, {"customer_id": "C", "title": "T",
+                                         "frequency": "monthly",
+                                         "start_date": "2026-09-01", "total": 1.0}),
+        (server.convert_quote_to_invoice, {"quote_id": "Q"}),
+        (server.convert_lead_to_customer, {"lead_id": "L"}),
+    ]
+    wrong = []
+    for fn, kwargs in explicit:
+        r = run(fn, idempotency_key="caller-supplied", **kwargs)
+        if r["headers"].get("Idempotency-Key") != "caller-supplied":
+            wrong.append(fn.__name__)
+    check(f"all {len(explicit)} contract-Idem tools honour a caller key",
+          not wrong, ", ".join(wrong))
+
     print("\nno GET tool ever sends an Idempotency-Key")
+    RECORDED.clear()
+    server.list_receipts()
+    server.get_bill(bill_id="B")
+    server.aged_receivables()
     check("reads are unkeyed",
-          all("Idempotency-Key" not in x["headers"] for x in RECORDED if x["method"] == "GET"))
+          RECORDED and all("Idempotency-Key" not in x["headers"]
+                           for x in RECORDED if x["method"] == "GET"),
+          str([sorted(x["headers"]) for x in RECORDED]))
 
     print("\nper-workspace base URL")
     server._url_registry = {"staging": "https://staging.umbraerp.com"}

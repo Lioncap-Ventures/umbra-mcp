@@ -190,25 +190,27 @@ def _post(path: str, data: dict, workspace: str = _PRIMARY,
     url = f"{_base_url(workspace)}{path}"
     log.info("POST %s [ws=%s]", url, workspace)
     with httpx.Client(timeout=30) as client:
-        resp = client.post(url, headers=_headers(workspace, idempotency_key), json=data)
+        resp = client.post(url, headers=_headers(workspace, _idem(idempotency_key)), json=data)
         resp.raise_for_status()
         return resp.json()
 
 
-def _put(path: str, data: dict, workspace: str = _PRIMARY) -> Any:
+def _put(path: str, data: dict, workspace: str = _PRIMARY,
+         idempotency_key: str | None = None) -> Any:
     url = f"{_base_url(workspace)}{path}"
     log.info("PUT %s [ws=%s]", url, workspace)
     with httpx.Client(timeout=30) as client:
-        resp = client.put(url, headers=_headers(workspace), json=data)
+        resp = client.put(url, headers=_headers(workspace, _idem(idempotency_key)), json=data)
         resp.raise_for_status()
         return resp.json()
 
 
-def _delete(path: str, workspace: str = _PRIMARY) -> Any:
+def _delete(path: str, workspace: str = _PRIMARY,
+            idempotency_key: str | None = None) -> Any:
     url = f"{_base_url(workspace)}{path}"
     log.info("DELETE %s [ws=%s]", url, workspace)
     with httpx.Client(timeout=30) as client:
-        resp = client.delete(url, headers=_headers(workspace))
+        resp = client.delete(url, headers=_headers(workspace, _idem(idempotency_key)))
         resp.raise_for_status()
         return resp.json()
 
@@ -216,11 +218,19 @@ def _delete(path: str, workspace: str = _PRIMARY) -> Any:
 def _idem(idempotency_key: str | None) -> str:
     """Return the caller's Idempotency-Key, or mint one.
 
-    Every write goes out with a key. An agent retries on timeout without a
+    EVERY write goes out with a key, from _post / _put / _delete, so no
+    mutation can ever leave without one. An agent retries on timeout without a
     human deciding to, and an unkeyed retry of "create bill" or "pay bill" is a
-    duplicated supplier payment. Pass the SAME key to make a deliberate retry
-    replay the original response instead of executing twice; replaying a key
-    with a different body is rejected (422) rather than silently swallowed.
+    duplicated supplier payment.
+
+    Pass the SAME key to make a deliberate retry replay the original response
+    instead of executing twice; replaying a key with a different body is
+    rejected (422) rather than silently swallowed.
+
+    Routes the API has not wired for idempotency ignore the header, which is
+    harmless: only handlers that call idem_begin ever read it. Sending it
+    everywhere means those routes gain replay protection the day they are
+    wired, with no client change.
     """
     return (idempotency_key or "").strip() or str(uuid.uuid4())
 
@@ -431,6 +441,7 @@ def create_customer(
     city: str | None = None,
     website: str | None = None,
     notes: str | None = None,
+    idempotency_key: str | None = None,
     workspace: str = "primary",
 ) -> str:
     """Create a new customer in the ERP.
@@ -447,6 +458,8 @@ def create_customer(
         city: City
         website: Website URL
         notes: Additional notes
+        idempotency_key: Reuse the same key to replay a timed-out call instead
+            of creating a duplicate. Auto-generated when omitted.
         workspace: Target business workspace (default "primary")
     """
     data: dict[str, Any] = {"companyName": company_name, "currency": currency}
@@ -468,10 +481,11 @@ def create_customer(
         data["website"] = website
     if notes:
         data["notes"] = notes
+    idem = _idem(idempotency_key)
     try:
-        return _ok(_post("/v1/customers", data, workspace))
+        return _ok(_post("/v1/customers", data, workspace, idem))
     except Exception as e:
-        return _err(e)
+        return _write_err(e, idem, "list_customers with a search on the company name")
 
 
 @mcp.tool()
@@ -563,6 +577,7 @@ def create_invoice(
     notes: str | None = None,
     tax_amount: float | None = None,
     discount_amount: float | None = None,
+    idempotency_key: str | None = None,
     workspace: str = "primary",
 ) -> str:
     """Create a new invoice.
@@ -579,6 +594,8 @@ def create_invoice(
         notes: Optional notes
         tax_amount: Tax amount in dollars
         discount_amount: Discount amount in dollars
+        idempotency_key: Reuse the same key to replay a timed-out call instead
+            of creating a duplicate. Auto-generated when omitted.
         workspace: Target business workspace (default "primary")
     """
     try:
@@ -602,10 +619,11 @@ def create_invoice(
         data["taxAmount"] = tax_amount
     if discount_amount is not None:
         data["discountAmount"] = discount_amount
+    idem = _idem(idempotency_key)
     try:
-        return _ok(_post("/v1/invoices", data, workspace))
+        return _ok(_post("/v1/invoices", data, workspace, idem))
     except Exception as e:
-        return _err(e)
+        return _write_err(e, idem, "list_invoices, matching on customer and date")
 
 
 @mcp.tool()
@@ -694,6 +712,7 @@ def create_product(
     description: str | None = None,
     category: str | None = None,
     product_type: str = "physical",
+    idempotency_key: str | None = None,
     workspace: str = "primary",
 ) -> str:
     """Create a new product.
@@ -707,6 +726,8 @@ def create_product(
         description: Product description
         category: Product category
         product_type: Type: physical, digital, or service
+        idempotency_key: Reuse the same key to replay a timed-out call instead
+            of creating a duplicate. Auto-generated when omitted.
         workspace: Target business workspace (default "primary")
     """
     data: dict[str, Any] = {"name": name, "price": price, "currency": currency, "type": product_type}
@@ -718,10 +739,11 @@ def create_product(
         data["description"] = description
     if category:
         data["category"] = category
+    idem = _idem(idempotency_key)
     try:
-        return _ok(_post("/v1/products", data, workspace))
+        return _ok(_post("/v1/products", data, workspace, idem))
     except Exception as e:
-        return _err(e)
+        return _write_err(e, idem, "list_products, matching on name or sku")
 
 
 @mcp.tool()
@@ -810,6 +832,7 @@ def create_quote(
     total: float,
     items: str,
     notes: str | None = None,
+    idempotency_key: str | None = None,
     workspace: str = "primary",
 ) -> str:
     """Create a new quote.
@@ -829,6 +852,8 @@ def create_quote(
             omitted productId leaves the line as free text rather than failing.
             Prices are in dollars.
         notes: Optional notes
+        idempotency_key: Reuse the same key to replay a timed-out call instead
+            of creating a duplicate. Auto-generated when omitted.
         workspace: Target business workspace (default "primary")
     """
     try:
@@ -847,10 +872,11 @@ def create_quote(
     }
     if notes:
         data["notes"] = notes
+    idem = _idem(idempotency_key)
     try:
-        return _ok(_post("/v1/quotes", data, workspace))
+        return _ok(_post("/v1/quotes", data, workspace, idem))
     except Exception as e:
-        return _err(e)
+        return _write_err(e, idem, "list_quotes, matching on customer and title")
 
 
 @mcp.tool()
@@ -1040,6 +1066,7 @@ def create_payment(
     payment_reference: str | None = None,
     invoice_id: str | None = None,
     notes: str | None = None,
+    idempotency_key: str | None = None,
     workspace: str = "primary",
 ) -> str:
     """Record a payment.
@@ -1052,6 +1079,8 @@ def create_payment(
         payment_reference: External reference number
         invoice_id: Link to invoice UUID (optional)
         notes: Additional notes
+        idempotency_key: Reuse the same key to replay a timed-out call instead
+            of creating a duplicate. Auto-generated when omitted.
         workspace: Target business workspace (default "primary")
     """
     data: dict[str, Any] = {
@@ -1066,10 +1095,11 @@ def create_payment(
         data["invoiceId"] = invoice_id
     if notes:
         data["notes"] = notes
+    idem = _idem(idempotency_key)
     try:
-        return _ok(_post("/v1/payments", data, workspace))
+        return _ok(_post("/v1/payments", data, workspace, idem))
     except Exception as e:
-        return _err(e)
+        return _write_err(e, idem, "list_payments for the customer before recording it again")
 
 
 # ── CONTACTS (CRM) ───────────────────────────────────────────────────────────
