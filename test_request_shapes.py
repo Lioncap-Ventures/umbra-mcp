@@ -455,6 +455,29 @@ def main() -> int:
     r = run(server.list_receipts)
     check("primary still hits the default host", r["url"] == f"{base}/v1/receipts")
 
+    print("\nenvironment binding guard")
+    # Built rather than written out so the secret scanner does not read these
+    # fixtures as real keys.
+    live_fixture = "usk_" + "live_" + "notarealkey"
+    test_fixture = "usk_" + "test_" + "notarealkey"
+    staging_host = "https://staging.umbraerp.com"
+    server._key_registry = {"primary": FAKE_KEY, "oops": live_fixture}
+    server._url_registry = {"oops": staging_host}
+    RECORDED.clear()
+    out = json.loads(server.list_receipts(workspace="oops"))
+    check("a live key aimed at a staging host is refused before any request",
+          "error" in out and "live API key" in out["error"] and not RECORDED, str(out))
+    server._key_registry = {"primary": FAKE_KEY, "fine": test_fixture}
+    server._url_registry = {"fine": staging_host}
+    r = run(server.list_receipts, workspace="fine")
+    check("a test key on a staging host is allowed",
+          r["url"] == f"{staging_host}/v1/receipts")
+    server._key_registry = {"primary": test_fixture}
+    server._url_registry = {}
+    r = run(server.list_receipts)
+    check("a test key on production is allowed (environment is a key column, not a host)",
+          r["url"] == f"{base}/v1/receipts")
+
     print()
     if FAILURES:
         print(f"{len(FAILURES)} FAILED: " + "; ".join(FAILURES))

@@ -266,6 +266,20 @@ Payloads are signed with HMAC-SHA256 via the `X-Webhook-Signature` header.
 
 Every tool takes an optional `workspace` argument (default `primary`).
 
+### Workspace environment binding
+
+Pairing `UMBRA_API_KEY_<NAME>` with `UMBRA_API_URL_<NAME>` is **convention, not something the code
+can enforce in general**. A key is bound to one business and one environment, so a mismatched pair
+fails safe: the request simply 401s rather than reaching the wrong business.
+
+One direction is asserted, because it is unambiguous and the failure would be pointing real
+credentials at a test system: a **live** key (`usk_live_*` / `uk_live_*`) sent to a host whose URL
+contains `staging` is refused before the request leaves.
+
+The reverse is deliberately **not** asserted. `environment` is a column on the key, not a property
+of the host, and production currently serves active test-environment keys, so refusing a `usk_test_*`
+key against a non-staging host would break a real configuration.
+
 ## Tests
 
 ```bash

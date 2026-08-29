@@ -169,8 +169,33 @@ def _base_url(workspace: str = _PRIMARY) -> str:
 # HTTP helpers
 # ============================================================================
 
+_LIVE_KEY_PREFIXES = ("usk_live_", "uk_live_")
+
+
+def _guard_env_binding(workspace: str, key: str, url: str) -> None:
+    """Refuse to send a LIVE key to a host that looks like staging.
+
+    Pairing UMBRA_API_KEY_<NAME> with UMBRA_API_URL_<NAME> is convention, not
+    something the code can enforce in general: a mismatch normally fails safe
+    as a 401 because a key is bound to one business and one environment.
+
+    Only this direction is asserted. The reverse (a test-prefixed key against
+    a non-staging host) is legitimate: `environment` is a column on the key,
+    not a property of the host, and production currently serves active
+    test-environment keys. Refusing those would break a real configuration.
+    """
+    if key.startswith(_LIVE_KEY_PREFIXES) and "staging" in url.lower():
+        raise ValueError(
+            f"Refusing to send a live API key to a staging host. Workspace "
+            f"'{workspace}' resolves to {url} but holds a {key[:9]} key. Check "
+            f"UMBRA_API_KEY_{workspace.upper()} and UMBRA_API_URL_{workspace.upper()}."
+        )
+
+
 def _headers(workspace: str = _PRIMARY, idempotency_key: str | None = None) -> dict[str, str]:
-    headers = {"X-Api-Key": _resolve_key(workspace), "Content-Type": "application/json"}
+    key = _resolve_key(workspace)
+    _guard_env_binding((workspace or _PRIMARY).strip().lower(), key, _base_url(workspace))
+    headers = {"X-Api-Key": key, "Content-Type": "application/json"}
     if idempotency_key:
         headers["Idempotency-Key"] = idempotency_key
     return headers
