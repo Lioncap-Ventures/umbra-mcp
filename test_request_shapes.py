@@ -19,6 +19,9 @@ import server
 FAKE_KEY = "usk_test_offline"
 RECORDED: list[dict] = []
 FAILURES: list[str] = []
+# What a GET replays. Lets a test stand in for a server that restates the
+# header from the lines, or an older one that leaves it stale.
+GET_PAYLOAD: dict = {"data": {"id": "fake", "items": []}}
 
 
 class _FakeResponse:
@@ -55,6 +58,8 @@ class _FakeClient:
             "body": json,
             "params": params or {},
         })
+        if method == "GET":
+            return _FakeResponse(GET_PAYLOAD)
         return _FakeResponse({"data": {"id": "fake", "items": []}})
 
     def get(self, url, headers=None, params=None):
@@ -199,42 +204,104 @@ def main() -> int:
     out = json.loads(server.update_lead(lead_id="L-UUID", updates="{not json}"))
     check("bad JSON rejected without any HTTP call", "error" in out and not RECORDED)
 
-    print("\nupdate_quote: items derive the header totals (the money-safety fix)")
+    print("\nline maths: TAX-INCLUSIVE, mirroring the API's _derive_totals_from_items")
+    taxed = {"description": "X", "quantity": 1, "unitPrice": 100.00,
+             "total": 100.00, "taxRate": 15}
+    check("a 100.00 line at 15% carries 13.04 of tax, not 15.00",
+          server._line_tax(taxed) == 13.04, str(server._line_tax(taxed)))
+    check("100.00 at 15% derives 86.96 / 13.04 / 100.00",
+          server._derive_document_totals([taxed])
+          == {"subtotal": 86.96, "taxAmount": 13.04, "total": 100.00},
+          str(server._derive_document_totals([taxed])))
+    check("total is NOT subtotal + tax (no double count)",
+          server._derive_document_totals([taxed])["total"] == 100.00)
+    check("explicit per-line taxAmount is used as given",
+          server._derive_document_totals([{"total": 100.00, "taxAmount": 13.04}])
+          == {"subtotal": 86.96, "taxAmount": 13.04, "total": 100.00})
+    check("zero-rated lines collapse subtotal onto total",
+          server._derive_document_totals([{"total": 250.0}, {"total": -90.0}])
+          == {"subtotal": 160.0, "taxAmount": 0.0, "total": 160.0})
+    check("_line_total explicit branch is tax-inclusive",
+          server._line_total({"total": 100.0}) == 100.0)
+    check("_line_total computed branch is tax-inclusive too",
+          server._line_total({"quantity": 2, "unitPrice": 50.0}) == 100.0,
+          str(server._line_total({"quantity": 2, "unitPrice": 50.0})))
+    check("computed branch honours discountPercent",
+          server._line_total({"quantity": 1, "unitPrice": 100.0, "discountPercent": 10}) == 90.0)
+    check("both branches agree on the same line",
+          server._line_total({"quantity": 2, "unitPrice": 50.0, "total": 100.0})
+          == server._line_total({"quantity": 2, "unitPrice": 50.0}))
+    check("multi-line tax sums from the lines",
+          server._derive_document_totals([taxed, dict(taxed)])
+          == {"subtotal": 173.92, "taxAmount": 26.08, "total": 200.00},
+          str(server._derive_document_totals([taxed, dict(taxed)])))
+
+    print("\nupdate_quote: the server owns the header, the tool owns per-line tax")
+    global GET_PAYLOAD
+    GET_PAYLOAD = {"data": {"id": "fake", "subtotal": 160.0, "taxAmount": 0.0,
+                            "total": 160.0,
+                            "items": [{"description": "Starter"}, {"description": "Credit"}]}}
     r = run(server.update_quote, quote_id="Q-UUID",
             updates=json.dumps({"notes": "Repriced",
                                 "items": [{"description": "Starter", "quantity": 1,
                                            "unitPrice": 250.0, "total": 250.0},
                                           {"description": "Credit", "quantity": 1,
                                            "unitPrice": -90.0, "total": -90.0}]}))
-    put = [x for x in RECORDED if x["method"] == "PUT"][0]
-    check("subtotal derived from the lines", put["body"]["subtotal"] == 160.0, str(put["body"]))
-    check("total derived from the lines", put["body"]["total"] == 160.0, str(put["body"]))
-    check("items still sent verbatim", len(put["body"]["items"]) == 2)
+    puts = [x for x in RECORDED if x["method"] == "PUT"]
+    check("header figures are NOT injected; the server restates them",
+          not ({"subtotal", "taxAmount", "total"} & set(puts[0]["body"])),
+          str(sorted(puts[0]["body"])))
+    check("items still sent verbatim", len(puts[0]["body"]["items"]) == 2)
     check("re-reads the quote after writing items",
           any(x["method"] == "GET" for x in RECORDED),
           str([x["method"] for x in RECORDED]))
+    check("a restating server needs no corrective write", len(puts) == 1, str(len(puts)))
 
     r = run(server.update_quote, quote_id="Q-UUID",
             updates=json.dumps({"subtotal": 999.0, "total": 999.0,
                                 "items": [{"description": "X", "quantity": 1,
                                            "unitPrice": 1.0, "total": 1.0}]}))
     put = [x for x in RECORDED if x["method"] == "PUT"][0]
-    check("explicit totals are never overridden",
+    check("explicit header figures are forwarded untouched",
           (put["body"]["subtotal"], put["body"]["total"]) == (999.0, 999.0), str(put["body"]))
 
+    GET_PAYLOAD = {"data": {"id": "fake", "subtotal": 86.96, "taxAmount": 13.04,
+                            "total": 100.0, "items": [{"description": "Taxed"}]}}
     r = run(server.update_quote, quote_id="Q-UUID",
-            updates=json.dumps({"items": [{"description": "Taxed", "quantity": 2,
-                                           "unitPrice": 100.0, "total": 200.0,
+            updates=json.dumps({"items": [{"description": "Taxed", "quantity": 1,
+                                           "unitPrice": 100.0, "total": 100.0,
                                            "taxRate": 15}]}))
     put = [x for x in RECORDED if x["method"] == "PUT"][0]
-    check("per-line taxRate rolls into taxAmount and total",
-          (put["body"]["subtotal"], put["body"]["taxAmount"], put["body"]["total"]) == (200.0, 30.0, 230.0),
-          str(put["body"]))
+    check("taxRate line gets a tax-inclusive per-line taxAmount",
+          put["body"]["items"][0]["taxAmount"] == 13.04, str(put["body"]["items"][0]))
+    check("still no header injection alongside it",
+          not ({"subtotal", "taxAmount", "total"} & set(put["body"])), str(sorted(put["body"])))
+
+    print("\nupdate_quote: a stale header gets one corrective write")
+    GET_PAYLOAD = {"data": {"id": "fake", "subtotal": 575.0, "taxAmount": 0.0,
+                            "total": 575.0,
+                            "items": [{"description": "Starter"}, {"description": "Credit"}]}}
+    RECORDED.clear()
+    out = json.loads(server.update_quote(
+        quote_id="Q-UUID",
+        updates=json.dumps({"items": [{"description": "Starter", "quantity": 1,
+                                       "unitPrice": 250.0, "total": 250.0},
+                                      {"description": "Credit", "quantity": 1,
+                                       "unitPrice": -90.0, "total": -90.0}]})))
+    puts = [x for x in RECORDED if x["method"] == "PUT"]
+    check("a non-restating server triggers a corrective PUT", len(puts) == 2, str(len(puts)))
+    check("the corrective PUT carries the derived header",
+          puts[1]["body"] == {"subtotal": 160.0, "taxAmount": 0.0, "total": 160.0},
+          str(puts[1]["body"]))
+    check("drift is reported when it cannot be corrected",
+          out["headerReconciles"] is False and "warning" in out,
+          str(out.get("headerReconciles")))
+    GET_PAYLOAD = {"data": {"id": "fake", "items": []}}
 
     r = run(server.update_quote, quote_id="Q-UUID", updates='{"title": "New title"}')
     check("no items means a plain single PUT, no derivation, no re-read",
           len(RECORDED) == 1 and RECORDED[0]["body"] == {"title": "New title"},
-          str(RECORDED))
+          str([x["method"] for x in RECORDED]))
 
     print("\nread tools: query parameter names")
     r = run(server.aged_receivables, as_of="2026-08-31", customer_id="C-UUID")

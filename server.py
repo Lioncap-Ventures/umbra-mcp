@@ -284,37 +284,62 @@ def _csv_list(value: str | None) -> list[str]:
 
 
 def _line_total(item: dict) -> float:
-    """Net dollar total of one document line.
+    """TAX-INCLUSIVE dollar total of one document line.
 
-    Prefers the caller's explicit `total`; falls back to quantity x unitPrice
-    less discountPercent so a caller who omits it still gets a coherent header.
+    Umbra's line convention is tax-inclusive: `total` is what the line is
+    worth with its tax and discount already in it, and `unitPrice` is likewise
+    a tax-inclusive price. Both branches here return the same kind of number.
+
+    Prefers the caller's explicit `total`, because that is the figure they
+    displayed. Falls back to quantity x unitPrice less discountPercent, which
+    under this convention is also tax-inclusive.
     """
     if item.get("total") is not None:
         return float(item["total"])
     gross = float(item.get("quantity", 1) or 0) * float(item.get("unitPrice", 0) or 0)
-    return gross * (1 - float(item.get("discountPercent", 0) or 0) / 100.0)
+    return round(gross * (1 - float(item.get("discountPercent", 0) or 0) / 100.0), 2)
 
 
-def _derive_document_totals(items: list[dict], payload: dict) -> dict[str, float]:
-    """Derive {subtotal, taxAmount, total} in DOLLARS from a line-item array.
+def _line_tax(item: dict) -> float:
+    """Tax contained WITHIN one line's tax-inclusive total, in dollars.
 
-    Used only to backfill keys the caller did not send. The API patches the
-    header figures and the lines independently: sending `items` alone replaces
-    the lines but leaves `subtotal`/`total` at their old values, which is how a
-    quote ends up with lines that add to $250 under a total that still reads
-    $575. Deriving them keeps the document internally consistent.
+    Uses the caller's explicit per-line `taxAmount` when present. Otherwise
+    backs the tax out of the inclusive total at `taxRate`:
+    tax = total - total / (1 + rate/100). A 100.00 line at 15% carries 13.04
+    of tax over an 86.96 net, NOT 15.00 on top of 100.00.
+
+    The API stores a line's `taxAmount` but never computes one from `taxRate`,
+    so without this a caller who sends only a rate gets a quote whose header
+    tax silently reads zero.
     """
-    subtotal = round(sum(_line_total(i) for i in items), 2)
-    if payload.get("taxAmount") is not None:
-        tax = float(payload["taxAmount"])
-    else:
-        tax = round(sum(_line_total(i) * float(i.get("taxRate", 0) or 0) / 100.0
-                        for i in items), 2)
-    discount = float(payload.get("discountAmount") or 0)
+    if item.get("taxAmount") is not None:
+        return float(item["taxAmount"])
+    rate = float(item.get("taxRate", 0) or 0)
+    if not rate:
+        return 0.0
+    total = _line_total(item)
+    return round(total - total / (1 + rate / 100.0), 2)
+
+
+def _derive_document_totals(items: list[dict]) -> dict[str, float]:
+    """Header figures implied by a line array, in DOLLARS.
+
+    Mirrors the API's own `_derive_totals_from_items` exactly, so the tool and
+    the server never disagree about what a document is worth:
+
+        total    = sum(line total)          (tax-inclusive)
+        taxAmount= sum(line tax)            (contained within those totals)
+        subtotal = total - taxAmount        (the pre-tax figure)
+
+    `total` is NOT subtotal + tax. The tax is already inside the line totals,
+    so adding it again would overstate the document by exactly the tax.
+    """
+    total = round(sum(_line_total(i) for i in items), 2)
+    tax = round(sum(_line_tax(i) for i in items), 2)
     return {
-        "subtotal": subtotal,
+        "subtotal": round(total - tax, 2),
         "taxAmount": tax,
-        "total": round(subtotal - discount + tax, 2),
+        "total": total,
     }
 
 
@@ -851,18 +876,27 @@ def update_quote(quote_id: str, updates: str, workspace: str = "primary") -> str
     Editing lines in place replaces the old delete-and-recreate workaround,
     which burned the quote number and its history.
 
-    MONEY SAFETY. The API patches the header figures and the lines
-    independently, so `items` on its own moves the lines and leaves `subtotal`
-    / `total` at their old values; a quote whose lines add to $250 under a
-    total that still reads $575. When you send `items` without `subtotal` /
-    `total`, this tool derives them from the lines (sum of line totals, plus
-    per-line `taxRate`, less any `discountAmount` you sent) so the document
-    cannot contradict itself. Send them explicitly to override the derivation.
+    MONEY SAFETY. Line totals are TAX-INCLUSIVE: a line's `total` already
+    contains its tax, so the document total is the sum of the line totals and
+    `subtotal` is that sum minus the tax, never plus it.
 
-    Whenever `items` is sent the quote is re-read after the write and the tool
-    returns the SERVER's post-write state under `quote`, with `itemsSent`,
-    `itemsStored` and `itemsRoundTripped` so a silently dropped line array is
-    visible instead of reading as a bare 200.
+    Send `items` alone and the server restates `subtotal` / `taxAmount` /
+    `total` from the lines for you. State any of them explicitly and yours
+    wins, for a negotiated round number or a discount the lines do not carry.
+    This tool does not second-guess either path: it never injects header
+    figures you did not send.
+
+    What it does add is per-line `taxAmount`. The server stores a line's tax
+    but never computes one from `taxRate`, so a line carrying only a rate
+    would leave the header tax reading zero. When a line has `taxRate` and no
+    `taxAmount`, the tax is backed out of the inclusive total (a 100.00 line
+    at 15% carries 13.04 of tax over an 86.96 net) and sent with the line.
+
+    After any items write the quote is re-read and the tool returns the
+    SERVER's state under `quote`, with `itemsSent` / `itemsStored` /
+    `itemsRoundTripped` and a reconciliation of the stored header against the
+    lines, so a dropped array or a stale total is visible instead of reading
+    as a bare 200.
 
     Args:
         quote_id: The quote's public UUID
@@ -878,30 +912,65 @@ def update_quote(quote_id: str, updates: str, workspace: str = "primary") -> str
     if items is not None:
         if not isinstance(items, list) or not all(isinstance(i, dict) for i in items):
             return json.dumps({"error": "'items' must be an array of objects"})
-        derived = _derive_document_totals(items, data)
-        for field in ("subtotal", "taxAmount", "total"):
-            if field not in data:
-                data[field] = derived[field]
+        # Backfill only the per-line tax the server cannot work out for itself.
+        # Header figures are left to the server unless the caller stated them.
+        items = [dict(i) for i in items]
+        for item in items:
+            if item.get("taxAmount") is None and item.get("taxRate"):
+                item["taxAmount"] = _line_tax(item)
+        data["items"] = items
 
     try:
         result = _put(f"/v1/quotes/{quote_id}", data, workspace)
         if items is None:
             return _ok(result)
+
+        expected = _derive_document_totals(items)
+        stated = {k: float(data[k]) for k in ("subtotal", "taxAmount", "total")
+                  if k in data}
+        expected.update(stated)
+
         # Re-read: the write is not done until the server says the lines moved.
         fresh = _get(f"/v1/quotes/{quote_id}", workspace=workspace).get("data") or {}
         stored = fresh.get("items") or []
+        actual = {k: fresh.get(k) for k in ("subtotal", "taxAmount", "total")}
+
+        drift = {k: {"expected": expected[k], "stored": actual[k]}
+                 for k in expected
+                 if actual.get(k) is not None
+                 and round(float(actual[k]) - expected[k], 2) != 0}
+
+        if drift and not stated:
+            # An older server that replaces lines without restating the header
+            # leaves the quote contradicting itself. One corrective write.
+            log.warning("quote %s header did not restate; correcting %s", quote_id, drift)
+            _put(f"/v1/quotes/{quote_id}", expected, workspace)
+            fresh = _get(f"/v1/quotes/{quote_id}", workspace=workspace).get("data") or {}
+            stored = fresh.get("items") or []
+            actual = {k: fresh.get(k) for k in ("subtotal", "taxAmount", "total")}
+            drift = {k: {"expected": expected[k], "stored": actual[k]}
+                     for k in expected
+                     if actual.get(k) is not None
+                     and round(float(actual[k]) - expected[k], 2) != 0}
+
         out: dict[str, Any] = {
             "quote": fresh,
             "itemsSent": len(items),
             "itemsStored": len(stored),
             "itemsRoundTripped": len(stored) == len(items),
-            "derivedTotals": {k: v for k, v in data.items()
-                              if k in ("subtotal", "taxAmount", "total")},
+            "headerFromLines": expected,
+            "headerStored": actual,
+            "headerReconciles": not drift,
         }
         if not out["itemsRoundTripped"]:
             out["warning"] = (
                 f"Sent {len(items)} line(s) but the quote now stores {len(stored)}. "
                 "The line items did NOT land; do not send this quote to a customer."
+            )
+        elif drift:
+            out["warning"] = (
+                f"The stored header does not match the lines: {drift}. Do not send "
+                "this quote to a customer until the figures agree."
             )
         return _ok(out)
     except Exception as e:
